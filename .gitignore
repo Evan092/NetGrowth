@@ -1,0 +1,3 @@
+backend/training_data/*
+.venv/
+frontend/node_modules
