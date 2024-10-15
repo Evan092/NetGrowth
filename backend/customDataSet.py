@@ -106,6 +106,9 @@ class CustomImageDataset(Dataset):
         # Load image
         image = Image.open(img_path)
 
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+
         adjustX = 0
         adjustY=0
         scale_x=1
