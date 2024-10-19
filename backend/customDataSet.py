@@ -73,15 +73,16 @@ class CustomImageDataset(Dataset):
         self.maxBBoxes = maxBBoxes
 
     def pad_to_target_size(self, image_tensor, target_width, target_height):
-        # Get the current tensor dimensions (assuming shape is [C, H, W])
-        _, height, width = image_tensor.shape
+        # Get the current tensor dimensions (assuming shape is [C, W, H])
+        _, width, height = image_tensor.shape
         
         # Calculate padding needed for both width and height
         pad_width = max(0, target_width - width)
         pad_height = max(0, target_height - height)
         
-        # Padding is applied as (left, top, right, bottom)
-        padding = (pad_width // 2, pad_height // 2, pad_width - pad_width // 2, pad_height - pad_height // 2)
+        # Padding is applied as (top, right, bottom, left)
+        #padding = (pad_width // 2, pad_height // 2, pad_width - pad_width // 2, pad_height - pad_height // 2)
+        padding = (pad_height // 2, pad_width // 2, pad_height - pad_height // 2, pad_width - pad_width // 2)
         
         # Apply padding using F.pad (for tensors), padding must be in (left, right, top, bottom) order
         padded_image_tensor = F.pad(image_tensor, padding, fill=0)
@@ -125,30 +126,34 @@ class CustomImageDataset(Dataset):
             # Retrieve the annotations for this image
             ann_ids = self.img2Anns.get(image_id, [])
             bboxes = []
-
+            bboxes_with_lengths = []
             for ann_id in ann_ids:
                 ann = self.anns.get(ann_id)
                 if ann:
-                    if ann['utf8_string'] != ".":
-                        bbox = ann['bbox']  # Extract bounding box
-                        bbox[0] = (bbox[0]*scale_x) + adjustX
-                        bbox[1] = (bbox[1]*scale_y) + adjustY
-                        bbox[2] = (bbox[2]*scale_x) + adjustX
-                        bbox[3] = (bbox[3]*scale_y) + adjustY
+                    bbox = ann['bbox']  # Extract bounding box
+                    bbox[0] = (bbox[0]*scale_x) + adjustX
+                    bbox[1] = (bbox[1]*scale_y) + adjustY
+                    bbox[2] = (bbox[2]*scale_x) + adjustX
+                    bbox[3] = (bbox[3]*scale_y) + adjustY
 
-                        if bbox[0] > bbox[2]:
-                            temp = bbox[2]
-                            bbox[2] = bbox[0]
-                            bbox[0] = temp
+                    if bbox[0] > bbox[2]:
+                        temp = bbox[2]
+                        bbox[2] = bbox[0]
+                        bbox[0] = temp
 
-                        if bbox[1] > bbox[3]:
-                            temp = bbox[3]
-                            bbox[3] = bbox[1]
-                            bbox[1] = temp
+                    if bbox[1] > bbox[3]:
+                        temp = bbox[3]
+                        bbox[3] = bbox[1]
+                        bbox[1] = temp
 
-                        bboxes.append(bbox)
-                        if len(bboxes) == self.maxBBoxes:
-                            break
+                    # Append bounding box and the length of the string
+                    bboxes_with_lengths.append((bbox, len(ann['utf8_string'])))
+
+            # Sort bounding boxes by the length of the utf8_string in descending order
+            bboxes_with_lengths.sort(key=lambda x: x[1], reverse=True)
+
+            # Extract just the bounding boxes for the top maxBBoxes entries
+            bboxes = [bbox for bbox, _ in bboxes_with_lengths[:self.maxBBoxes]]
 
             while len(bboxes) < self.maxBBoxes:
                 bboxes.append([0,0,0,0])
