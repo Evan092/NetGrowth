@@ -1,1 +1,2 @@
 desired_size=512
+max_boxes=250

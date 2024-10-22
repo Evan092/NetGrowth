@@ -2,3 +2,6 @@ backend/training_data/*
 .venv/
 frontend/node_modules
 .vscode/
+backend/__pycache__/*
+log/*
+runs/*

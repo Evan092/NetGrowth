@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -233,11 +234,10 @@ def train(model, loader, criterion, optimizer):
         if False:
             print("")
         # Compute the loss between predicted and true bounding box coordinates
-        loss = criterion(outputs, bboxes)
+        loss = criterion(outputs, bboxes, writer, epoch * len(train_loader) + batch_idx)
 
         # Log training loss for this batch to TensorBoard
         current_lr = optimizer.param_groups[0]['lr']
-        writer.add_scalar('Loss/train', loss.item(), epoch * len(train_loader) + batch_idx)
         writer.add_scalar('Learning Rate', current_lr, epoch * len(train_loader) + batch_idx)
         
         # Backward pass and optimization
@@ -254,7 +254,7 @@ def train(model, loader, criterion, optimizer):
         outputs_flat = outputs_trimmed.view(-1, 4)
         avg_batch_iou  = 0#calculate_valid_iou(outputs_flat, bboxes.view(-1,4))  # IoU between predicted and true boxes
         #avg_batch_iou = batch_iou.diag().mean().item()  # Average IoU for the batch
-        writer.add_scalar('avg iou', avg_batch_iou, epoch * len(train_loader) + batch_idx)
+        #writer.add_scalar('avg iou', avg_batch_iou, epoch * len(train_loader) + batch_idx)
 
         total_iou += avg_batch_iou * images.size(0)
 
@@ -290,7 +290,7 @@ def evaluate(model, loader, criterion):
             if False:
                 print("")
             # Compute the loss between predicted and true bounding box coordinates
-            loss = criterion(outputs, bboxes)
+            loss = criterion(outputs, bboxes, writer)
 
             # Accumulate the loss for the current batch
             running_loss += loss.item() * images.size(0)
@@ -426,8 +426,18 @@ learning_rate = 0.001
 alpha=.5
 batch_size = 64
 desired_size=Constants.desired_size
-writer = SummaryWriter('runs/YOLO2 Lr'+str(learning_rate) + " wd" + str(weight_decay) + " a" + str(alpha) + " bs"+str(batch_size))
+writer = ""
+
+
+
 if __name__ == "__main__":
+            num=1
+            while os.path.exists('runs/YOLO v'+str(num)+' Lr'+str(learning_rate) + " wd" + str(weight_decay) + " a" + str(alpha) + " bs"+str(batch_size)):
+                num += 1
+
+
+            writer = SummaryWriter('runs/YOLO v'+str(num)+' Lr'+str(learning_rate) + " wd" + str(weight_decay) + " a" + str(alpha) + " bs"+str(batch_size))
+            print(writer.log_dir)
         #learning_rate = 0.001
         #for j in range(4):
             #if j%2==1:
@@ -466,7 +476,7 @@ if __name__ == "__main__":
             #max_boxes_train = compute_max_boxes(train_loader)
             #max_boxes_test = compute_max_boxes(test_loader)
             #max_boxes = max(max_boxes_train, max_boxes_test)
-            max_boxes = 35
+            max_boxes = Constants.max_boxes
 
             train_dataset.setMaxBBoxes(max_boxes)
             test_dataset.setMaxBBoxes(max_boxes)
@@ -477,18 +487,18 @@ if __name__ == "__main__":
             cnn_model = BoundingBoxCnn(max_boxes).to(device)
             max_norm = 5
             #criterion = nn.CrossEntropyLoss()
-            criterion = CombinedLoss(alpha=alpha).to(device)#nn.SmoothL1Loss().to(device)#CombinedLoss().to(device)
+            criterion = CombinedLoss().to(device)#nn.SmoothL1Loss().to(device)#CombinedLoss().to(device)
             optimizer = optim.Adam(cnn_model.parameters(), lr=learning_rate, weight_decay=weight_decay) #, weight_decay=5e-4
             # Warm-up scheduler for the first 10 epochs
             #warmup_scheduler = LinearLR(optimizer, start_factor=0.01, total_iters=10)
 
             # ReduceLROnPlateau for long-term control
-            plateau_scheduler = ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5, threshold=0.01)
+            plateau_scheduler = ReduceLROnPlateau(optimizer, mode='min', patience=10, factor=0.5, threshold=0.01)
 
             # Combine both schedulers
             #scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, plateau_scheduler], milestones=[10])
             
-            num_epochs = 50
+            num_epochs = 100
             print()
             epoch = 0
 
