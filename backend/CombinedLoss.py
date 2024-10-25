@@ -7,7 +7,173 @@ import Constants
 from GIoULoss import GIoULoss
 import torch
 
-def yolo_to_corners(boxes):
+
+
+def filter_confidences(pred_boxes, confidences, threshold=0.5):
+    """
+    Filter predicted boxes and their confidences based on a confidence threshold.
+    
+    Parameters:
+    - pred_boxes: Tensor of predicted boxes [N, 4].
+    - confidences: Tensor of confidence scores [N, 1].
+    - threshold: Float, the minimum confidence score to keep a box.
+    
+    Returns:
+    - filtered_boxes: Tensor of filtered boxes.
+    - filtered_confidences: Tensor of filtered confidence scores, retaining the original shape [M, 1].
+    """
+    mask = confidences.squeeze(1) >= threshold  # Use squeeze(1) to safely remove the singleton dimension for comparison
+
+    # Use the mask to filter out boxes and confidences
+    filtered_boxes = pred_boxes[mask]  # Apply the mask to the boxes
+    filtered_confidences = confidences[mask]  # Apply the mask to the confidences
+
+    # Reshape if necessary to ensure correct dimensions
+    if filtered_boxes.dim() == 1:  # Only one box passed the filter
+        filtered_boxes = filtered_boxes.unsqueeze(0)
+    if filtered_confidences.dim() == 1:  # Only one confidence score passed the filter
+        filtered_confidences = filtered_confidences.unsqueeze(0)
+
+    return filtered_boxes, filtered_confidences
+
+def apply_nms(pred_boxes, confidences, iou_threshold=0.5):
+    """
+    Apply Non-Maximum Suppression to reduce overlapping boxes and ensure the confidence tensor's shape is maintained as [N, 1].
+
+    Parameters:
+    - pred_boxes: Tensor of filtered predicted boxes [N, 4].
+    - confidences: Tensor of filtered confidence scores [N, 1].
+    - iou_threshold: Float, the IoU threshold for filtering overlaps.
+
+    Returns:
+    - kept_boxes: Tensor of boxes kept after NMS.
+    - kept_confidences: Tensor of confidence scores of kept boxes, shape [K, 1] where K is the number of boxes kept.
+    """
+    # Apply NMS using the confidences squeezed to one dimension for proper NMS functionality
+    keep_indices = torchvision.ops.nms(pred_boxes, confidences.squeeze(1), iou_threshold)
+
+    # Index the results with keep_indices. The result for boxes is straightforward.
+    kept_boxes = pred_boxes[keep_indices]
+
+    # For confidences, ensure the output shape is [K, 1] by using keep_indices
+    kept_confidences = confidences[keep_indices]
+
+    return kept_boxes, kept_confidences
+
+
+def filter_and_trim_boxes(pred_boxes, target_boxes, max_boxes=Constants.max_boxes):
+    batch_size, grid_size, _, num_boxes, _ = pred_boxes.shape
+
+    # Reshape pred_boxes to [batch_size, grid_size * grid_size * num_boxes, 5]
+    pred_boxes = pred_boxes.view(batch_size, -1, 5)
+
+    # Split pred_boxes into coordinates and confidences
+    pred_coords = pred_boxes[..., :4]  # [batch_size, N, 4]
+    pred_confidences = pred_boxes[..., 4]  # [batch_size, N]
+
+    # Step 1: Create a valid mask for target_boxes to filter out [0, 0, 0, 0] boxes
+    valid_mask = (target_boxes.sum(dim=-1) > 0)  # Shape: [batch_size, max_boxes]
+
+    # Step 2: For each image in the batch, filter out the padded boxes and match the predictions
+    filtered_target_boxes = []
+    filtered_pred_boxes = []
+    filtered_confidences = []
+
+    for i in range(batch_size):
+        # Get valid target boxes for the current image
+        valid_boxes = target_boxes[i][valid_mask[i]]  # Shape: [num_valid, 4]
+
+        # Number of valid target boxes
+        num_valid = valid_boxes.shape[0]
+
+        # Sort predicted boxes by confidence (descending)
+        _, topk_indices = torch.topk(pred_confidences[i], num_valid, largest=True)
+
+        # Select the top-k most confident predicted boxes and their confidences
+        filtered_pred_coords = pred_coords[i][topk_indices]  # Shape: [num_valid, 4]
+        filtered_confidences_flat = pred_confidences[i][topk_indices].unsqueeze(-1)  # [num_valid, 1]
+
+        refiltered_pred_boxes, refiltered_confidences = filter_confidences(filtered_pred_coords, filtered_confidences_flat)
+        nmsfiltered_pred_boxes, nmsfiltered_confidences = apply_nms(refiltered_pred_boxes, refiltered_confidences)
+
+        # Append the filtered results for this image
+        filtered_target_boxes.append(valid_boxes)
+        filtered_pred_boxes.append(nmsfiltered_pred_boxes)
+        filtered_confidences.append(nmsfiltered_confidences)
+
+
+
+
+
+    # Step 3: Concatenate results from all images in the batch
+    target_boxes_flat = torch.cat(filtered_target_boxes, dim=0)  # Shape: [total_valid, 4]
+    pred_boxes_flat = torch.cat(filtered_pred_boxes, dim=0)      # Shape: [total_valid, 4]
+    confidences_flat = torch.cat(filtered_confidences, dim=0)    # Shape: [total_valid, 1]
+
+
+    return target_boxes_flat, pred_boxes_flat, confidences_flat
+
+def postprocess_yolo_output(output, loaded_anchor_boxes, stride=(Constants.desired_size/16)):
+    batch_size, height, width, num_boxes, _ = output.shape
+    cx, cy = generate_grid_indices(height, width, output.device)
+
+    # Apply sigmoid to normalize x, y coordinates
+    output[..., 0:2] = torch.sigmoid(output[..., 0:2])
+
+    # Adjust x and y to be the center of each cell:
+    output[..., 0] += cx.unsqueeze(-1)  # Add grid x indices for each box
+    output[..., 1] += cy.unsqueeze(-1)  # Add grid y indices for each box
+
+    # Convert x, y from grid index to absolute pixel values
+    output[..., 0] *= stride
+    output[..., 1] *= stride
+
+    # Adjust widths and heights from the anchor boxes
+    if loaded_anchor_boxes is not None and len(loaded_anchor_boxes) == num_boxes:
+        # Assuming anchor boxes is a tensor of shape [5, 2] (5 anchor boxes, each with width and height)
+        anchor_widths = loaded_anchor_boxes[:, 0].unsqueeze(0).unsqueeze(1).unsqueeze(1).unsqueeze(-1)
+        anchor_heights = loaded_anchor_boxes[:, 1].unsqueeze(0).unsqueeze(1).unsqueeze(1).unsqueeze(-1)
+        # Shape becomes [1, 1, 1, 5, 1] to match [batch_size, height, width, num_boxes, 1]
+
+        # Now, expand anchor_widths to match the output dimensions
+        anchor_widths = anchor_widths.expand(batch_size, height, width, num_boxes, 1)
+        anchor_heights = anchor_heights.expand(batch_size, height, width, num_boxes, 1)
+
+        output[..., 2] = (torch.exp(output[..., 2]).unsqueeze(-1) * anchor_widths * Constants.desired_size).squeeze(-1)
+        output[..., 3] = (torch.exp(output[..., 3]).unsqueeze(-1) * anchor_heights * Constants.desired_size).squeeze(-1)
+
+    else:
+        raise ValueError("Anchor boxes not configured correctly.")
+
+    # Apply sigmoid to confidence scores
+    output[..., 4] = torch.sigmoid(output[..., 4])
+
+    return output
+
+def generate_grid_indices(height, width, device):
+    """
+    Generate grid indices for each cell in the grid.
+    """
+    grid_y, grid_x = torch.meshgrid(torch.arange(height), torch.arange(width), indexing='ij')
+    return grid_x.to(device).float(), grid_y.to(device).float()
+
+class ClampBoxCoords(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, inputs, min_val, max_val):
+        ctx.save_for_backward(inputs)
+        ctx.min_val = min_val
+        ctx.max_val = max_val
+        return inputs.clamp(min=min_val, max=max_val)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        inputs, = ctx.saved_tensors
+        grad_input = grad_output.clone()
+        grad_input[inputs < ctx.min_val] = 0
+        grad_input[inputs > ctx.max_val] = 0
+        return grad_input, None, None
+
+def yolo_to_corners(boxes, anchor_boxes):
     """
     Converts YOLO output (x, y, width, height) to (x1, y1, x2, y2).
     
@@ -33,6 +199,14 @@ def yolo_to_corners(boxes):
 
     # Stack into the (x1, y1, x2, y2) format
     return torch.stack((x1, y1, x2, y2), dim=1)
+
+
+def clipBoxes(pred_boxes, target_boxes):
+    # Clipping coordinates using the custom ClampBoxCoords function
+    clipped_pred_boxes = ClampBoxCoords.apply(pred_boxes, 0, Constants.desired_size)
+    clipped_target_boxes = ClampBoxCoords.apply(target_boxes, 0, Constants.desired_size)
+    return clipped_pred_boxes, clipped_target_boxes
+
 
 def fix_box_coordinates(boxes, epsilon=1):
     # Ensure (x1, y1) is top-left and (x2, y2) is bottom-right
@@ -96,50 +270,6 @@ def extract_top_bboxes(pred_tensor, max_boxes=Constants.max_boxes):
         topk_conf = torch.cat([topk_conf, torch.zeros(batch_size, padding, device=pred_tensor.device)], dim=1)
 
     return topk_coords, topk_conf
-
-def filter_and_trim_boxes(pred_boxes, target_boxes, max_boxes=Constants.max_boxes):
-    batch_size, grid_size, _, num_boxes, _ = pred_boxes.shape
-
-    # Reshape pred_boxes to [batch_size, grid_size * grid_size * num_boxes, 5]
-    pred_boxes = pred_boxes.view(batch_size, -1, 5)
-
-    # Split pred_boxes into coordinates and confidences
-    pred_coords = pred_boxes[..., :4]  # [batch_size, N, 4]
-    pred_confidences = pred_boxes[..., 4]  # [batch_size, N]
-
-    # Step 1: Create a valid mask for target_boxes to filter out [0, 0, 0, 0] boxes
-    valid_mask = (target_boxes.sum(dim=-1) > 0)  # Shape: [batch_size, max_boxes]
-
-    # Step 2: For each image in the batch, filter out the padded boxes and match the predictions
-    filtered_target_boxes = []
-    filtered_pred_boxes = []
-    filtered_confidences = []
-
-    for i in range(batch_size):
-        # Get valid target boxes for the current image
-        valid_boxes = target_boxes[i][valid_mask[i]]  # Shape: [num_valid, 4]
-
-        # Number of valid target boxes
-        num_valid = valid_boxes.shape[0]
-
-        # Sort predicted boxes by confidence (descending)
-        _, topk_indices = torch.topk(pred_confidences[i], num_valid, largest=True)
-
-        # Select the top-k most confident predicted boxes and their confidences
-        filtered_pred_coords = pred_coords[i][topk_indices]  # Shape: [num_valid, 4]
-        filtered_confidences_flat = pred_confidences[i][topk_indices].unsqueeze(-1)  # [num_valid, 1]
-
-        # Append the filtered results for this image
-        filtered_target_boxes.append(valid_boxes)
-        filtered_pred_boxes.append(filtered_pred_coords)
-        filtered_confidences.append(filtered_confidences_flat)
-
-    # Step 3: Concatenate results from all images in the batch
-    target_boxes_flat = torch.cat(filtered_target_boxes, dim=0)  # Shape: [total_valid, 4]
-    pred_boxes_flat = torch.cat(filtered_pred_boxes, dim=0)      # Shape: [total_valid, 4]
-    confidences_flat = torch.cat(filtered_confidences, dim=0)    # Shape: [total_valid, 1]
-
-    return target_boxes_flat, pred_boxes_flat, confidences_flat
 
 
 def coordinate_penalty_loss(pred_boxes, max=Constants.desired_size):
@@ -215,22 +345,7 @@ class DIoULoss(nn.Module):
         Returns:
             Tensor: DIoU loss.
         """
-        # 1. Calculate the area of predicted and target boxes
-        pred_area = (pred_boxes[..., 2] - pred_boxes[..., 0]).clamp(0) * (pred_boxes[..., 3] - pred_boxes[..., 1]).clamp(0)
-        target_area = (target_boxes[..., 2] - target_boxes[..., 0]).clamp(0) * (target_boxes[..., 3] - target_boxes[..., 1]).clamp(0)
-
-        # 2. Calculate the intersection coordinates
-        inter_x1 = torch.max(pred_boxes[..., 0], target_boxes[..., 0])
-        inter_y1 = torch.max(pred_boxes[..., 1], target_boxes[..., 1])
-        inter_x2 = torch.min(pred_boxes[..., 2], target_boxes[..., 2])
-        inter_y2 = torch.min(pred_boxes[..., 3], target_boxes[..., 3])
-
-        # 3. Calculate the intersection area
-        inter_area = (inter_x2 - inter_x1).clamp(0) * (inter_y2 - inter_y1).clamp(0)
-
-        # 4. Calculate IoU
-        union_area = pred_area + target_area - inter_area
-        iou = inter_area / (union_area + eps)
+        iou = IoULoss.calculate_valid_iou(pred_boxes, target_boxes)
 
         # 5. Calculate the center points of both boxes
         pred_center_x = (pred_boxes[..., 0] + pred_boxes[..., 2]) / 2
@@ -256,6 +371,8 @@ class DIoULoss(nn.Module):
 
         # Return the mean loss over the batch
         return loss
+    
+
 
 # Define IoU loss (Inverse IoU loss)
 class IoULoss(nn.Module):
@@ -271,11 +388,36 @@ class IoULoss(nn.Module):
         #pred_boxes_flat = torch.clamp(pred_boxes_flat, min=0, max=512)
         #target_boxes_flat = torch.clamp(target_boxes_flat, min=0, max=512)
 
-        avg_batch_iou  = IoULoss.calculate_valid_iou(pred_boxes_flat, true_boxes_flat)  # IoU between predicted and true boxes
+        avg_batch_iou  = IoULoss.calculate_iou(pred_boxes_flat, true_boxes_flat)  # IoU between predicted and true boxes
         
         return 1 - avg_batch_iou
 
 
+    def calculate_iou(box1, box2):
+        """ Calculate IoU of single predicted and ground truth box """
+        # Determine the coordinates of the intersection rectangle
+        x_left = max(box1[0], box2[0])
+        y_top = max(box1[1], box2[1])
+        x_right = min(box1[2], box2[2])
+        y_bottom = min(box1[3], box2[3])
+
+        if x_right < x_left or y_bottom < y_top:
+            return 0.0
+
+        # The area of intersection
+        intersection_area = (x_right - x_left) * (y_bottom - y_top)
+
+        # The area of both rectangles
+        box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+
+        # Compute the union area by using Inclusion-Exclusion principle
+        union_area = box1_area + box2_area - intersection_area
+
+        # Compute the IoU
+        iou = intersection_area / union_area
+        return iou
+    
     def calculate_valid_iou(pred_boxes, target_boxes):
         # Fix coordinates to ensure correct order and min margin
         #pred_boxes = IoULoss.fix_box_coordinates(pred_boxes)
@@ -311,12 +453,13 @@ class ConfidencePenalty(nn.Module):
 
 
 class CombinedLoss(nn.Module):
-    def __init__(self):
+    def __init__(self, anchor_boxes):
         super(CombinedLoss, self).__init__()
         self.iou_loss = IoULoss()
-        self.smooth_l1_loss = nn.SmoothL1Loss()
+        self.smooth_l1_loss = nn.SmoothL1Loss(reduction='none')
         self.diou_loss = DIoULoss()
         self.confidencePenalty = ConfidencePenalty()
+        self.anchor_boxes = anchor_boxes
 
         #Weight of All Penalties vs All Loss functions
         #1 for penalties, 0 for Loss Functions
@@ -324,8 +467,8 @@ class CombinedLoss(nn.Module):
         
 
 
-        self.IoUScale = 2 # Weight of IoU loss
-        self.DIoUScale = 0.5 #Weight of DIoU loss
+        self.IoUScale = 1 # Weight of IoU loss
+        self.DIoUScale = 0 #Weight of DIoU loss
         self.SmoothL1LossScale = 1 #Weight of SmoothL1Loss
 
 
@@ -335,59 +478,16 @@ class CombinedLoss(nn.Module):
         self.coordinate_penalty_weight = 0.0
         self.confidence_penalty_weight = 0.0
 
+        self.negativePenaltyWeight = 0.2
+
+        self.GoodMultiplier = 2
+        self.BadMultiplier = 1.2
+
     def updateAlpha(self, alpha):
         self.alpha = alpha
 
     def getAlpha(self):
         return self.alpha
-    
-    def generate_grid_indices(self, output):
-        batch_size, num_boxes, height, width, _ = output.shape
-        # Create a grid of x coordinates
-        cx = torch.arange(width).repeat(height, 1)  # This repeats the range [0, width-1] for each row
-        cx = cx.repeat(batch_size * num_boxes, 1, 1)  # This repeats the grid for each box in each batch
-        cx = cx.view(batch_size, num_boxes, height, width).to(output.device)  # Reshape and send to the correct device
-
-        # Create a grid of y coordinates
-        cy = torch.arange(height).repeat(width, 1).t()  # This creates a transposed repeat, [0, height-1] for each column
-        cy = cy.repeat(batch_size * num_boxes, 1, 1)  # Repeat for each box in each batch
-        cy = cy.view(batch_size, num_boxes, height, width).to(output.device)  # Reshape and send to the correct device
-
-        return cx, cy
-    
-    def postprocess_yolo_output(self, output, stride= (Constants.desired_size/16)):
-        """
-        Convert YOLO model output from grid-relative coordinates to absolute image coordinates.
-
-        Parameters:
-        - output: the raw output from the YOLO model.
-        - stride: the stride of the grid (image size divided by grid size).
-
-        Returns:
-        - output: the adjusted output with absolute coordinates.
-        """
-        # Calculate the grid indices (cx, cy) for each prediction
-        batch_size, num_boxes, height, width, _ = output.shape
-        cx, cy = self.generate_grid_indices(output)
-
-        # Apply sigmoid to x, y to normalize them to (0,1)
-        output[..., 0:2] = torch.sigmoid(output[..., 0:2])
-
-        # Adjust x and y to be the center of the cell:
-        output[..., 0] += cx  # cx is the x-index of the cell
-        output[..., 1] += cy  # cy is the y-index of the cell
-
-        # Convert x, y from grid index to absolute pixel values
-        output[..., 0] *= stride  # Convert cx to absolute x coordinates
-        output[..., 1] *= stride  # Convert cy to absolute y coordinates
-
-        # Adjust widths and heights from the anchors (assuming anchor sizes are in 'output[..., 2:4]')
-        output[..., 2:4] = torch.exp(output[..., 2:4]) * stride
-
-        # Apply sigmoid to confidence score to normalize it to (0,1)
-        output[..., 4] = torch.sigmoid(output[..., 4])
-
-        return output
     
 
     def forward(self, pred_boxes, target_boxes, writer, step=-1):
@@ -399,13 +499,13 @@ class CombinedLoss(nn.Module):
         pred_width = pred_boxes[..., 2]
         pred_height = pred_boxes[..., 3]
 
-        negative_width_penalty = torch.clamp(1-pred_width, min=0)  # Only penalize if < 0
-        negative_height_penalty = torch.clamp(1-pred_height, min=0)  # Only penalize if < 0
+        negative_width_penalty = torch.clamp(-pred_width, min=0)  # Only penalize if < 0
+        negative_height_penalty = torch.clamp(-pred_height, min=0)  # Only penalize if < 0
 
 
 
 
-        pred_boxes = self.postprocess_yolo_output(pred_boxes)
+        pred_boxes = postprocess_yolo_output(pred_boxes, self.anchor_boxes)
 
 
         #Trim the padding bboxes, and remove the least confident bboxes for the corresponding batch Item
@@ -421,7 +521,10 @@ class CombinedLoss(nn.Module):
         #pred_boxes[:, 2] = torch.clamp(pred_boxes[:, 2], min=1)  # Clamp width
         #pred_boxes[:, 3] = torch.clamp(pred_boxes[:, 3], min=1)  # Clamp height
 
-        pred_boxes = yolo_to_corners(pred_boxes)
+        pred_boxes = yolo_to_corners(pred_boxes, self.anchor_boxes)
+
+
+        _, target_boxes = clipBoxes(pred_boxes,target_boxes)
         #ConfidencePenalty = confidence_penalty_loss(confidences_flat, 1)
         #penalty = CoordinatePenalty + ConfidencePenalty
         #confidences_flat = torch.clamp(confidences_flat, 0, 1)
@@ -450,53 +553,73 @@ class CombinedLoss(nn.Module):
 
         #Measure overlaps. 0 is perfect, 1 is none
         #Add a penalty for non-perfect overlap
+        mask = torch.ones(target_boxes.shape[0], dtype=torch.bool, device=target_boxes.device)
 
+        pad_size = target_boxes.shape[0]-pred_boxes.shape[0]
 
-        iou_loss_value = self.iou_loss(pred_boxes, target_boxes)
+        if pad_size > 0:
+            padding = torch.zeros(pad_size, 4, device=pred_boxes.device)
+            confPadding =  torch.zeros(pad_size, 1, device=pred_boxes.device)
+            pred_boxes = torch.cat([pred_boxes, padding], dim=0)
+            confidences_scaled = torch.cat([confidences_scaled, confPadding], dim=0)
+            mask[-pad_size:] = False  # Update mask to indicate padded areas
 
-        #get loss for distance from coordinates. Divide by desired_size to scale 0-1
-        smooth_l1_loss_value = (self.smooth_l1_loss(pred_boxes, target_boxes)/Constants.desired_size)
+        try:
+            iou_loss_value = 0 #self.iou_loss(pred_boxes, target_boxes)
 
-        #Formula for overlaps + distance
-        diou_loss_value = self.diou_loss(pred_boxes,target_boxes)
+            #get loss for distance from coordinates. Divide by desired_size to scale 0-1
+            smooth_l1_loss_value = (self.smooth_l1_loss(pred_boxes, target_boxes)/Constants.desired_size)
+
+            #Formula for overlaps + distance
+            diou_loss_value = self.diou_loss(pred_boxes,target_boxes)
+        except Exception as e:
+            # Code that runs for any other exception
+            print(f"An error occurred: {e}")
+
+        
+        smooth_l1_loss_value = smooth_l1_loss_value * mask.unsqueeze(1)
+        iou_loss_value = iou_loss_value * mask.float()
+        diou_loss_value = diou_loss_value * mask.float()
 
         #scale
         iou_loss_value_scaled = iou_loss_value * self.IoUScale
         diou_loss_value_scaled = diou_loss_value * self.DIoUScale
-        smooth_l1_loss_scaled = smooth_l1_loss_value * self.SmoothL1LossScale
+        smooth_l1_loss_scaled = (smooth_l1_loss_value * self.SmoothL1LossScale).mean(dim=1, keepdim=True)
 
 
         maxLoss = self.IoUScale + self.DIoUScale + self.SmoothL1LossScale
-        x = (iou_loss_value_scaled + diou_loss_value + smooth_l1_loss_scaled)
-        y= confidences_scaled
-        GoodMultiplier = 2
-        BadMultiplier = 1.5
+        x = (iou_loss_value_scaled + diou_loss_value + smooth_l1_loss_scaled)/mask.float().sum()
+        y= confidences_scaled/mask.float().sum()
+
 
 
         # Loss formula
-        good_loss = torch.sqrt((0 - x)**2 + (1 - y)**2) * GoodMultiplier
-        bad_loss = torch.sqrt((maxLoss - x)**2 + (1 - y)**2) * BadMultiplier
+        good_loss = torch.sqrt((0 - x)**2 + (1 - y)**2) * self.GoodMultiplier
+        bad_loss = torch.sqrt((maxLoss - x)**2 + (1 - y)**2) * self.BadMultiplier
 
         # Final loss calculation
         losses = good_loss - bad_loss
-        losses = torch.clamp(losses.mean() + (maxLoss * BadMultiplier), min=0)
+        
+        losses = losses
+        losses = torch.clamp(losses + (maxLoss * self.BadMultiplier), min=0).mean()
         #losses = loss (self.IoUScale + self.DIoUScale + self.SmoothL1LossScale) - ((diou_loss_value_scaled + iou_loss_value_scaled + smooth_l1_loss_scaled) * confidences_scaled).mean()
 
-        losses = losses
+        
         #Scale total losses with confidence
 
+        negative_penalty_loss = (negative_width_penalty + negative_height_penalty).mean() * self.negativePenaltyWeight
 
         if step != -1:
             writer.add_scalar('avg Confidence', confidences_flat.mean(), step)
             writer.add_scalar('avg Coordinate', pred_boxes.mean(), step)
-            writer.add_scalar('iou_loss_value', iou_loss_value_scaled.mean(), step)
+            writer.add_scalar('Negative Penalty', negative_penalty_loss, step)
+            #writer.add_scalar('iou_loss_value', iou_loss_value_scaled.mean(), step)
             writer.add_scalar('diou_loss_value', diou_loss_value_scaled.mean(), step)
             writer.add_scalar('smooth_l1_loss_value', smooth_l1_loss_scaled.mean(), step)
             writer.add_scalar('Loss/train', losses.item(), step)
 
 
         # Add the negative width and height penalties to the total loss
-        negative_penalty_loss = (negative_width_penalty + negative_height_penalty).mean()
 
             
         # Compute the final mean loss, ignoring 0-confidence boxes

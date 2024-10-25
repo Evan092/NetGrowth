@@ -1,4 +1,6 @@
+import json
 import os
+from charset_normalizer import detect
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -7,25 +9,136 @@ import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 import torchvision.transforms.functional as F
 from GIoULoss import GIoULoss
+import DisplayImage
 from customDataSet import CustomImageDataset
 import torchvision.ops as ops
 from transforms import ResizeToMaxDimension
 from datetime import datetime
 import torch.profiler
-from CombinedLoss import CombinedLoss
+from CombinedLoss import *
 import Constants
 import math
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, ReduceLROnPlateau
 from torch.utils.tensorboard import SummaryWriter
 import torch.multiprocessing as mp
 import gc
+from ultralytics.yolo.models.yolo import Detect
+
+
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+import torch
+import torch.nn as nn
+
+class YOLOv3(nn.Module):
+    def __init__(self, num_classes=1):
+        super(YOLOv3, self).__init__()
+        
+        self.num_classes = num_classes
+        self.num_anchors = 1  # 3 anchors per detection scale
+        self.out_channels = self.num_anchors * (5 + num_classes)
+
+        # Convolution + BatchNorm + LeakyReLU block
+        def conv_block(in_channels, out_channels, kernel_size, stride):
+            padding = (kernel_size - 1) // 2
+            return nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, bias=False),
+                nn.BatchNorm2d(out_channels),
+                nn.LeakyReLU(0.1)
+            )
+
+        # Residual block with skip connections
+        class ResidualBlock(nn.Module):
+            def __init__(self, in_channels, out_channels):
+                super().__init__()
+                self.block = nn.Sequential(
+                    conv_block(in_channels, out_channels // 2, 1, 1),  # 1x1 reduction
+                    conv_block(out_channels // 2, out_channels, 3, 1)  # 3x3 expansion
+                )
+
+            def forward(self, x):
+                return x + self.block(x)  # Skip connection
+
+        # Backbone: Darknet-53
+        self.backbone = nn.Sequential(
+            conv_block(3, 32, 3, 1),            # Layer 1
+            conv_block(32, 64, 3, 2),           # Layer 2
+            ResidualBlock(64, 64),              # Layer 3-4
+
+            conv_block(64, 128, 3, 2),          # Layer 5
+            ResidualBlock(128, 128),            # Layer 6-7
+            ResidualBlock(128, 128),            # Layer 8-9
+
+            conv_block(128, 256, 3, 2),         # Layer 10
+            ResidualBlock(256, 256),            # Layer 11-12
+            ResidualBlock(256, 256),            # Layer 13-14
+            ResidualBlock(256, 256),            # Layer 15-16
+            ResidualBlock(256, 256),            # Layer 17-18
+            ResidualBlock(256, 256),            # Layer 19-20
+            ResidualBlock(256, 256),            # Layer 21-22
+            ResidualBlock(256, 256),            # Layer 23-24
+
+            conv_block(256, 512, 3, 2),         # Layer 25
+            ResidualBlock(512, 512),            # Layer 26-27
+            ResidualBlock(512, 512),            # Layer 28-29
+            ResidualBlock(512, 512),            # Layer 30-31
+            ResidualBlock(512, 512),            # Layer 32-33
+            ResidualBlock(512, 512),            # Layer 34-35
+            ResidualBlock(512, 512),            # Layer 36-37
+            ResidualBlock(512, 512),            # Layer 38-39
+
+            conv_block(512, 1024, 3, 2),        # Layer 40
+            ResidualBlock(1024, 1024),          # Layer 41-42
+            ResidualBlock(1024, 1024),          # Layer 43-44
+            ResidualBlock(1024, 1024),          # Layer 45-46
+            ResidualBlock(1024, 1024)           # Layer 47-48
+        )
+
+        # Neck: Feature Pyramid Network (FPN)
+        self.neck = nn.Sequential(
+            conv_block(1024, 512, 1, 1),
+            conv_block(512, 1024, 3, 1),
+            conv_block(1024, 512, 1, 1)
+        )
+
+        # Neck: Feature Pyramid Network (FPN) with Upsampling
+        self.upsample1 = nn.Upsample(scale_factor=2, mode='nearest')  # For medium objects
+        self.upsample2 = nn.Upsample(scale_factor=2, mode='nearest')  # For small objects
+
+        self.conv1 = conv_block(512, 512, 1, 1)  # Conv after upsample1
+        self.conv2 = conv_block(256, 256, 1, 1)   # Conv after upsample2
+
+        # Detection Layers
+        self.detect1 = nn.Conv2d(512, self.out_channels, 1)  # Large objects
+        self.detect2 = nn.Conv2d(512, self.out_channels, 1)  # Medium objects
+        self.detect3 = nn.Conv2d(256, self.out_channels, 1)  # Small objects
+
+    def forward(self, x):
+        # Pass input through the backbone
+        backbone_out = self.backbone(x)
+
+        # Pass through the neck
+        neck_out = self.neck(backbone_out)
+
+        # Detect objects at three scales
+        #out1 = self.detect1(neck_out)  # Large-scale detection
+        medium_feature = self.upsample1(neck_out)  # [B, 1024, 16, 16]
+        medium_feature = self.conv1(medium_feature)    # [B, 512, 16, 16]
+        out2 = self.detect2(medium_feature) 
+        #out3 = self.detect3(neck_out)  # Small-scale detection
+
+        #small_feature = self.upsample2(medium_feature)  # [B, 512, 32, 32]
+        #small_feature = self.conv2(small_feature)       # [B, 256, 32, 32]
+        #out3 = self.detect3(small_feature)  
+
+        return out2
+
 
 class BoundingBoxCnn(nn.Module):
-    def __init__(self, max_boxes, B=2):
+    def __init__(self, max_boxes, anchor_boxes, B=5):
         super().__init__()
+        self.anchor_boxes = anchor_boxes
         self.max_boxes = max_boxes
         self.maxWidth = Constants.desired_size
         self.maxHeight = Constants.desired_size
@@ -33,28 +146,43 @@ class BoundingBoxCnn(nn.Module):
         self.sigmoid = nn.Sigmoid()
         self.pool = nn.MaxPool2d(2,2)
         self.B = B
-        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1, stride=2)  # 512 -> 256
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1, stride=2)  # 256 -> 128
-        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1, stride=2)  # 128 -> 64
-        self.conv4 = nn.Conv2d(128, 256, kernel_size=3, padding=1, stride=2)  # 64 -> 32
-        self.conv5 = nn.Conv2d(256, 512, kernel_size=3, padding=1, stride=2)  # 32 -> 16
-        #self.conv6 = nn.Conv2d(512, 1024, kernel_size=3, padding=1, stride=2)  # 16 -> 8
-
-        self.convFinal = nn.Conv2d(512, 5*B, kernel_size=1)  # Predict 4 values (x, y, x2, y2, confidence) for each bbox
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1, stride=1)  # 512 -> 512
+        self.bn1 = nn.BatchNorm2d(32)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1, stride=1)  # 512 -> 256
+        self.bn2 = nn.BatchNorm2d(64)
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1, stride=1)  # 256 -> 256
+        self.bn3 = nn.BatchNorm2d(128)
+        self.conv4 = nn.Conv2d(128, 256, kernel_size=3, padding=1, stride=1)  # 256 -> 128
+        self.bn4 = nn.BatchNorm2d(256)
+        self.conv5 = nn.Conv2d(256, 256, kernel_size=3, padding=1, stride=1)  # 128 -> 128
+        self.bn5= nn.BatchNorm2d(256)
+        self.conv6 = nn.Conv2d(256, 256, kernel_size=3, padding=1, stride=1)  # 128 -> 64
+        self.bn6 = nn.BatchNorm2d(256)
+        self.conv7 = nn.Conv2d(256, 256, kernel_size=3, padding=1, stride=1)  # 64 -> 32
+        self.bn7 = nn.BatchNorm2d(256)
+        self.conv8 = nn.Conv2d(256, 256, kernel_size=3, padding=1, stride=1)  # 32 -> 16
+        self.bn8 = nn.BatchNorm2d(256)
+        self.convFinal = nn.Conv2d(256, 5*B, kernel_size=1)  # Predict 4 values (x, y, x2, y2, confidence) for each bbox
 
     def forward(self, x):#thrt
         #print(str(x.shape))
-        x = self.relu(self.conv1(x))
+        x = self.relu(self.bn1(self.conv1(x)))
         #print(str(x.shape))
-        x = self.relu(self.conv2(x))
+        x = self.relu(self.bn2(self.conv2(x)))
+        #x = self.pool(x)
+        x = self.relu(self.bn3(self.conv3(x)))
         #print(str(x.shape))
-        x = self.relu(self.conv3(x))
+        x = self.relu(self.bn4(self.conv4(x)))
+        x = self.pool(x)
         #print(str(x.shape))
-        x = self.relu(self.conv4(x))
+        x = self.relu(self.bn5(self.conv5(x)))
         #print(str(x.shape))
-        x = self.relu(self.conv5(x))
-        #print(str(x.shape))
-        #x = self.relu(self.conv6(x))
+        x = self.relu(self.bn6(self.conv6(x)))
+        x = self.pool(x)
+        x = self.relu(self.bn7(self.conv7(x)))
+        x = self.pool(x)
+        x = self.relu(self.bn8(self.conv8(x)))
+        x = self.pool(x)
         #print(str(x.shape))
         x = self.convFinal(x)  # [batch_size, max_boxes * 4, H, W]
         #print(str(x.shape))
@@ -208,33 +336,142 @@ def extract_top_bboxes2(pred_tensor, max_boxes=35):
     return torch.tensor(all_bboxes, dtype=torch.float32, device=pred_tensor.device, requires_grad=True), torch.tensor(confidences, dtype=torch.float32, device=pred_tensor.device, requires_grad=True)
 
 
-
+def get_nth_image(data_loader, n):
+    for i, (images, bboxes, paths) in enumerate(data_loader):
+        if i == n:
+            return images[0], bboxes[0], paths[0]  # Return the nth image and label
     
-def train(model, loader, criterion, optimizer):
+
+class ClampBoxCoords(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, inputs, min_val, max_val):
+        ctx.save_for_backward(inputs)
+        ctx.min_val = min_val
+        ctx.max_val = max_val
+        return inputs.clamp(min=min_val, max=max_val)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        inputs, = ctx.saved_tensors
+        grad_input = grad_output.clone()
+        grad_input[inputs < ctx.min_val] = 0
+        grad_input[inputs > ctx.max_val] = 0
+        return grad_input, None, None
+
+
+def generate_grid_indices(height, width, device):
+    """
+    Generate grid indices for each cell in the grid.
+    """
+    grid_y, grid_x = torch.meshgrid(torch.arange(height), torch.arange(width), indexing='ij')
+    return grid_x.to(device).float(), grid_y.to(device).float()
+
+
+
+def filter_confidences(pred_boxes, confidences, threshold=0.5):
+    """
+    Filter predicted boxes and their confidences based on a confidence threshold.
+    
+    Parameters:
+    - pred_boxes: Tensor of predicted boxes [N, 4].
+    - confidences: Tensor of confidence scores [N, 1].
+    - threshold: Float, the minimum confidence score to keep a box.
+    
+    Returns:
+    - filtered_boxes: Tensor of filtered boxes.
+    - filtered_confidences: Tensor of filtered confidence scores, retaining the original shape [M, 1].
+    """
+    # Create a mask for all elements that exceed the threshold
+    mask = (confidences >= threshold).squeeze()  # Squeeze to remove extra dimension for comparison, result is [N]
+
+    # Use the mask to filter out boxes and confidences
+    filtered_boxes = pred_boxes[mask]  # Apply the mask to the boxes
+    filtered_confidences = confidences[mask]  # Keep the result as [M, 1] where M is the number of elements that passed the filter
+
+    return filtered_boxes, filtered_confidences
+
+def apply_nms(pred_boxes, confidences, iou_threshold=0.5):
+    """
+    Apply Non-Maximum Suppression to reduce overlapping boxes and ensure the confidence tensor's shape is maintained as [N, 1].
+
+    Parameters:
+    - pred_boxes: Tensor of filtered predicted boxes [N, 4].
+    - confidences: Tensor of filtered confidence scores [N, 1].
+    - iou_threshold: Float, the IoU threshold for filtering overlaps.
+
+    Returns:
+    - kept_boxes: Tensor of boxes kept after NMS.
+    - kept_confidences: Tensor of confidence scores of kept boxes, shape [K, 1] where K is the number of boxes kept.
+    """
+    # Apply NMS using the confidences squeezed to one dimension for proper NMS functionality
+    keep_indices = torchvision.ops.nms(pred_boxes, confidences.squeeze(), iou_threshold)
+
+    # Index the results with keep_indices. The result for boxes is straightforward.
+    kept_boxes = pred_boxes[keep_indices]
+
+    # For confidences, ensure the output shape is [K, 1] by using keep_indices
+    kept_confidences = confidences[keep_indices]
+
+    return kept_boxes, kept_confidences
+
+
+def train(model, loader, criterion, optimizer, optionalLoader=None):
     model.train()  # Set the model to training mode
     running_loss = 0.0
     total = 0
     total_iou = 0.0
     i = 0
     iou_threshold=0.5
+    progress = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100]
+
+    if optionalLoader and False:
+        image, bbox, path = get_nth_image(optionalLoader, 1)
+        image = image.to(device)
+        image = image.unsqueeze(0)
+        bbox = bbox.to(device)
+        bbox = bbox.unsqueeze(0)
+        output = model(image)
+        output = postprocess_yolo_output(output)
+        bbox, output, _ = filter_and_trim_boxes(output, bbox)
+        bbox = fix_box_coordinates(bbox)
+        _, bbox = clipBoxes(output,bbox)
+        output =  yolo_to_corners(output, loaded_anchor_boxes)
+        DisplayImage.draw_bounding_boxes(path, bbox, output, transform)
+
     #for images, bboxes in loader:
-    for batch_idx, (images, bboxes) in enumerate(loader):
+    for batch_idx, (images, bboxes, _) in enumerate(loader):
         # Forward pass: compute model outputs (bounding box coordinates)
         i+=1
+
+        if (batch_idx == 1 or batch_idx % 30 == 0) and False:
+            image, bbox, path = get_nth_image(optionalLoader, 1)
+            image = image.to(device)
+            image = image.unsqueeze(0)
+            bbox = bbox.to(device)
+            bbox = bbox.unsqueeze(0)
+            output = model(image)
+            output = postprocess_yolo_output(output,loaded_anchor_boxes)
+            bbox, output, _ = filter_and_trim_boxes(output, bbox)
+            bbox = fix_box_coordinates(bbox)
+            _, bbox = clipBoxes(output,bbox)
+            output =  yolo_to_corners(output, loaded_anchor_boxes)
+            DisplayImage.draw_bounding_boxes(path, bbox, output, epoch+1, batch_idx, transform)
+
+
         percentage = (i / len(loader)) * 100
         # This checks if the current percentage point is approximately a multiple of 5
-        if int(percentage) % 10 == 0:  # Ensuring that it checks every 5% increment
-            print(f"{percentage:.2f}% ", end="", flush=True)
+        if len(progress) > 0 and int(percentage) >= progress[0]:  # Ensuring that it checks every 5% increment
+                print(f"{progress.pop(0)}% ", end="", flush=True)
         images = images.to(device)
         bboxes = bboxes.to(device)
         outputs = model(images)
 
 
-
+        #writer.add_scalar('Avg output', outputs[1].mean(), epoch * len(train_loader) + batch_idx)
         if False:
             print("")
         # Compute the loss between predicted and true bounding box coordinates
-        loss = criterion(outputs, bboxes, writer, epoch * len(train_loader) + batch_idx)
+        loss = criterion(outputs[1], bboxes, writer, epoch * len(train_loader) + batch_idx)
 
         # Log training loss for this batch to TensorBoard
         current_lr = optimizer.param_groups[0]['lr']
@@ -275,14 +512,15 @@ def evaluate(model, loader, criterion):
     total_iou=0.0
     i=0
     iou_threshold=0.5
+    progress = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100]
     with torch.no_grad():
-        for images, bboxes in loader:
+        for images, bboxes, _ in loader:
             # Forward pass: compute model outputs (bounding box coordinates)
             i+=1
             percentage = (i / len(loader)) * 100
             # This checks if the current percentage point is approximately a multiple of 5
-            if int(percentage) % 10 == 0:  # Ensuring that it checks every 5% increment
-                print(f"{percentage:.2f}% ", end="", flush=True)
+            if len(progress) > 0 and int(percentage) >= progress[0]:  # Ensuring that it checks every 5% increment
+                print(f"{progress.pop(0)}% ", end="", flush=True)
             images = images.to(device)
             bboxes = bboxes.to(device)
             outputs = model(images)
@@ -427,9 +665,15 @@ alpha=.5
 batch_size = 64
 desired_size=Constants.desired_size
 writer = ""
+loaded_anchor_boxes = None
 
-
-
+transform = transforms.Compose([
+    ResizeToMaxDimension(max_dim=desired_size),  # Resize based on max dimension while maintaining aspect ratio
+    #transforms.Grayscale(num_output_channels=1),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.3476, 0.3207, 0.2946], std=[0.3005, 0.2861, 0.2745])
+])
+epoch = 0
 if __name__ == "__main__":
             num=1
             while os.path.exists('runs/YOLO v'+str(num)+' Lr'+str(learning_rate) + " wd" + str(weight_decay) + " a" + str(alpha) + " bs"+str(batch_size)):
@@ -447,13 +691,6 @@ if __name__ == "__main__":
 
             #writer = SummaryWriter('runs/Lr'+str(learning_rate) + " wd" + str(weight_decay) + " a" + str(alpha) + " bs"+str(batch_size))
 
-            transform = transforms.Compose([
-                ResizeToMaxDimension(max_dim=desired_size),  # Resize based on max dimension while maintaining aspect ratio
-                #transforms.Grayscale(num_output_channels=1),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.3476, 0.3207, 0.2946], std=[0.3005, 0.2861, 0.2745])
-            ])
-
         #Mean: tensor([0.3476, 0.3207, 0.2946]), Std: tensor([0.3005, 0.2861, 0.2745])
 
 
@@ -469,8 +706,9 @@ if __name__ == "__main__":
             train_dataset.setMaxDimensions(desired_size, desired_size)
             test_dataset.setMaxDimensions(desired_size, desired_size)
 
+            #test_loader = DataLoader(dataset=test_dataset, batch_size=1, shuffle=False, num_workers=3,prefetch_factor=2,persistent_workers=True, pin_memory=True)
             train_loader = DataLoader(dataset=train_dataset, batch_size=batch_size, shuffle=True, num_workers=2,prefetch_factor=2,persistent_workers=True, pin_memory=True)
-            test_loader = DataLoader(dataset=test_dataset, batch_size=batch_size, shuffle=True, num_workers=2,prefetch_factor=2,persistent_workers=True, pin_memory=True)
+            train_loader_verified = DataLoader(dataset=test_dataset, batch_size=batch_size, shuffle=False, num_workers=2,prefetch_factor=2,persistent_workers=True, pin_memory=True)
 
             # Compute max_boxes from both training and test datasets
             #max_boxes_train = compute_max_boxes(train_loader)
@@ -484,10 +722,42 @@ if __name__ == "__main__":
             #mean, std = get_mean_std_RGB(train_loader)
             #print(f"Mean: {mean}, Std: {std}")
 
-            cnn_model = BoundingBoxCnn(max_boxes).to(device)
+            # Load the anchor boxes from a JSON file
+            with open('anchor_boxes.json', 'r') as file:
+                loaded_anchor_boxes = json.load(file)
+                loaded_anchor_boxes = torch.tensor(loaded_anchor_boxes, dtype=torch.float32).to(device)
+
+            #cnn_model = YOLOv3(num_classes=1).to(device)# BoundingBoxCnn(max_boxes, loaded_anchor_boxes).to(device)
+            cnn_model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=False).to(device)
+
+
+            # Set the number of classes to 1 (text detection)
+            cnn_model.model[-1].nc = 1  # Number of classes
+            cnn_model.names = ['text']   # Set the name of the class
+
+            # Define custom anchors (rescaled to match feature map size if needed)
+            anchors = torch.tensor([
+                [0.024182299094176685, 0.01957318537345516],
+                [0.09786826265627355, 0.20256818319648476],
+                [0.5129500743621527, 0.168960742084272],
+                [0.20809382877536947, 0.06999777642032576],
+                [0.07783910534023361, 0.042507661604262496]
+            ], dtype=torch.float32).view(1, -1, 2)
+
+            # Apply the custom anchors to the model's Detect layer
+            cnn_model.model[-1].anchors = anchors
+            cnn_model.model[-1].na = 5  # Number of anchors
+            cnn_model.model[-1].no = 6  # (5 + 1) = 6 outputs per anchor (bbox + conf + class)
+            
+            cnn_model.model[-1] = detect(
+                nc=1,  # 1 class (text detection)
+                anchors=anchors,
+                ch=[128, 256, 512]  # Input channels from the previous layers
+            )
+
             max_norm = 5
             #criterion = nn.CrossEntropyLoss()
-            criterion = CombinedLoss().to(device)#nn.SmoothL1Loss().to(device)#CombinedLoss().to(device)
+            criterion = CombinedLoss(anchor_boxes=anchors).to(device)#nn.SmoothL1Loss().to(device)#CombinedLoss().to(device)
             optimizer = optim.Adam(cnn_model.parameters(), lr=learning_rate, weight_decay=weight_decay) #, weight_decay=5e-4
             # Warm-up scheduler for the first 10 epochs
             #warmup_scheduler = LinearLR(optimizer, start_factor=0.01, total_iters=10)
@@ -497,10 +767,11 @@ if __name__ == "__main__":
 
             # Combine both schedulers
             #scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, plateau_scheduler], milestones=[10])
-            
+
+
+
             num_epochs = 100
             print()
-            epoch = 0
 
 
             print(f"Batch_Size={batch_size}")
@@ -521,9 +792,9 @@ if __name__ == "__main__":
                 #torch.nn.utils.clip_grad_norm_(cnn_model.parameters(), max_norm=max_norm)
                 print(f'==========Epoch [{epoch+1}/{num_epochs}] =========')
                 print(f'Training Progress ({datetime.now().strftime("%Y-%m-%d %H:%M:%S")}):')
-                train_loss, train_acc = train(cnn_model, train_loader, criterion, optimizer)
+                train_loss, train_acc = train(cnn_model, train_loader, criterion, optimizer, optionalLoader=train_loader_verified)
                 print(f'Evaluation Progress ({datetime.now().strftime("%Y-%m-%d %H:%M:%S")}):')
-                test_loss, test_acc = evaluate(cnn_model, test_loader, criterion)
+                test_loss, test_acc = 0,0 #evaluate(cnn_model, test_loader, criterion)
                 print(f'Finished. ({datetime.now().strftime("%Y-%m-%d %H:%M:%S")})\n'
                 f'Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}% - '
                     f'Test Loss: {test_loss:.4f}, Test Acc: {test_acc:.2f}%')

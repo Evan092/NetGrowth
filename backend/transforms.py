@@ -6,7 +6,12 @@ class ResizeToMaxDimension:
 
     def __call__(self, image):
         # Get the original image dimensions
-        width, height = image.size
+        width = 0
+        height = 0
+        try:
+            width, height = image.size
+        except Exception as e:
+            width, height = image.shape[:2]
 
         # Determine scaling factor to maintain aspect ratio
         if max(width, height) > self.max_dim:

@@ -1,0 +1,112 @@
+import multiprocessing
+import os
+import random
+import threading
+from PIL import Image
+import numpy as np
+import cv2
+import matplotlib.pyplot as plt
+import Constants
+
+import cv2
+import numpy as np
+
+def resize_and_pad(image, desired_size, color=(0, 0, 0)):
+    """
+    Resize an image to maintain aspect ratio with padding added to make it square.
+
+    Parameters:
+    - image: input image as a numpy array.
+    - desired_size: the size of the resulting square image (desired_size x desired_size).
+    - color: background color for padding, in BGR format.
+
+    Returns:
+    - A square image of the specified size.
+    """
+    old_size = image.shape[:2]  # old_size is in (height, width) format
+
+    # Calculate the ratio of the desired size to the old size
+    ratio = float(desired_size) / max(old_size)
+    new_size = tuple([int(x * ratio) for x in old_size])
+
+    # Resize the image to new_size (maintaining the aspect ratio)
+    resized = cv2.resize(image, (new_size[1], new_size[0]), interpolation=cv2.INTER_LINEAR)  # new_size should be in (width, height) format
+
+    # Create a new square image and fill with the color
+    new_image = np.full((desired_size, desired_size, 3), color, dtype=np.uint8)
+
+    # Compute center offset
+    x_offset = (desired_size - new_size[1]) // 2
+    y_offset = (desired_size - new_size[0]) // 2
+
+    # Place the resized image at the center of the square canvas
+    new_image[y_offset:y_offset + new_size[0], x_offset:x_offset + new_size[1]] = resized
+
+    return new_image
+
+epoch = 0
+i = 0
+def draw_bounding_boxes(image_path, truth_boxes, pred_boxes, epoch1, i1, transform=None, truth_color=(0, 255, 0), pred_color=(255, 0, 0), thickness=2):
+    """
+    Draw truth and predicted bounding boxes on an image and display it.
+
+    Parameters:
+    - image_path: path to the image file.
+    - truth_boxes: tensor of truth bounding boxes, where each box is [x1, y1, x2, y2].
+    - pred_boxes: tensor of predicted bounding boxes, where each box is [x1, y1, x2, y2].
+    - truth_color: color of the truth bounding boxes (R, G, B).
+    - pred_color: color of the predicted bounding boxes (R, G, B).
+    - thickness: line thickness of the boxes.
+    """
+    epoch=epoch1
+    i=i1
+    # Read the image
+    image = cv2.imread(image_path)
+    if image is None:
+        raise FileNotFoundError(f"The image path {image_path} does not exist.")
+    
+    image = resize_and_pad(image, Constants.desired_size)
+
+    # Convert colors from BGR to RGB (for Matplotlib compatibility)
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+    # Draw truth boxes
+    for (x1, y1, x2, y2) in truth_boxes:
+        start_point = (int(x1), int(y1))
+        end_point = (int(x2), int(y2))
+        image = cv2.rectangle(image, start_point, end_point, truth_color, thickness)
+
+    # Draw predicted boxes
+    for (x1, y1, x2, y2) in pred_boxes:
+        pred_color = (random.randint(0, 255), random.randint(0, 100), random.randint(0, 255))
+        start_point = (int(x1), int(y1))
+        end_point = (int(x2), int(y2))
+        image = cv2.rectangle(image, start_point, end_point, pred_color, thickness)
+
+    start_display_process(image, epoch, i)
+
+def display_image(image):
+    """Display an image using matplotlib."""
+    plt.figure(figsize=(10, 10))
+    plt.imshow(image)
+    plt.axis('off')
+    plt.show()
+
+def save_image(image, file_path):
+    """Save an image to a file using matplotlib."""
+    plt.figure(figsize=(10, 10))
+    plt.imshow(image)
+    plt.axis('off')
+    plt.savefig(file_path, bbox_inches='tight')  # Save the figure to a file
+    plt.close()
+
+def start_display_process(image, epoch, i):
+    """Start a new process to display the image."""
+    #display_process = multiprocessing.Process(target=display_image, args=(image,))
+    folder = "./backend/training_data/verify/epoch " + str(epoch)
+    if not os.path.exists(folder):
+        os.makedirs(folder)
+    display_process = multiprocessing.Process(target=save_image, args=(image, folder + "/Image " + str(i)))
+    display_process.start()
+    display_process.join()  # Wait for the process to close if needed
+

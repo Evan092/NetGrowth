@@ -21,8 +21,10 @@ class CustomImageDataset(Dataset):
         # Set the appropriate JSON file based on training or test data
         if train:
             annotations_file = "./backend/training_data/TextOCR_0.1_train.json"
+            #csv_file = "./backend/training_data/train-images-boxable-with-rotation.csv"
         else:
             annotations_file = "./backend/training_data/TextOCR_0.1_val.json"
+            #csv_file = "./backend/training_data/train-images-boxable-with-rotation.csv"
 
         # Load JSON data (images and optionally annotations)
         with open(annotations_file, 'r') as f:
@@ -100,6 +102,26 @@ class CustomImageDataset(Dataset):
         
         return scale_x, scale_y
 
+    def points_to_bbox(self, points):
+        """
+        Convert a list of points defining a polygon into a bounding box.
+
+        Parameters:
+        - points: List of floats where each pair of floats represents x, y coordinates of a vertex.
+
+        Returns:
+        - bbox: A list containing [min_x, min_y, max_x, max_y] which defines the bounding box.
+        """
+        x_coordinates = points[0::2]  # Extract all x coordinates
+        y_coordinates = points[1::2]  # Extract all y coordinates
+
+        min_x = min(x_coordinates)
+        max_x = max(x_coordinates)
+        min_y = min(y_coordinates)
+        max_y = max(y_coordinates)
+
+        bbox = [min_x, min_y, max_x, max_y]
+        return bbox
 
 
     def __getitem__(self, idx):
@@ -132,12 +154,7 @@ class CustomImageDataset(Dataset):
             for ann_id in ann_ids:
                 ann = self.anns.get(ann_id)
                 if ann:
-                    bbox = ann['bbox']  # Extract bounding box
-                    bbox[0] = (bbox[0]*scale_x) + adjustX
-                    bbox[1] = (bbox[1]*scale_y) + adjustY
-                    bbox[2] = (bbox[2]*scale_x) + adjustX
-                    bbox[3] = (bbox[3]*scale_y) + adjustY
-
+                    bbox = self.points_to_bbox(ann['points'])  # Extract bounding box
                     if bbox[0] > bbox[2]:
                         temp = bbox[2]
                         bbox[2] = bbox[0]
@@ -148,9 +165,17 @@ class CustomImageDataset(Dataset):
                         bbox[3] = bbox[1]
                         bbox[1] = temp
 
+                    #additionalAdjust = (bbox[0]*scale_x)/2
+                    bbox[0] = (bbox[0]*scale_x) + adjustX
+                    #additionalAdjust = (bbox[1]*scale_y)/2
+                    bbox[1] = (bbox[1]*scale_y) + adjustY
+                    bbox[2] = (bbox[2]*scale_x) + adjustX
+                    bbox[3] = (bbox[3]*scale_y) + adjustY
+
+
                     # Append bounding box and the length of the string
-                    if ann['utf8_string'] != ".":
-                        bboxes_with_lengths.append((bbox, len(ann['utf8_string'])))
+                    #if ann['utf8_string'] != ".":
+                    bboxes_with_lengths.append((bbox, len(ann['utf8_string'])))
 
             if len(bboxes_with_lengths) > self.maxValid:
                 self.maxValid = max(self.maxValid, len(bboxes_with_lengths))
@@ -161,6 +186,9 @@ class CustomImageDataset(Dataset):
             # Extract just the bounding boxes for the top maxBBoxes entries
             bboxes = [bbox for bbox, _ in bboxes_with_lengths[:self.maxBBoxes]]
 
+            if len(bboxes) == 0:
+                print("None")
+
             while len(bboxes) < self.maxBBoxes:
                 bboxes.append([0,0,0,0])
 
@@ -168,6 +196,6 @@ class CustomImageDataset(Dataset):
             bboxes = torch.as_tensor(bboxes, dtype=torch.float32)
 
             # Return image and bounding boxes as tensors
-            return image, bboxes
+            return image, bboxes, img_path
         else:
             return image
