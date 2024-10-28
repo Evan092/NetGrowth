@@ -1,3 +1,3 @@
-desired_size=640
+desired_size=480
 max_boxes=250
 

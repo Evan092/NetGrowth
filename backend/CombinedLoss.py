@@ -6,6 +6,7 @@ import torchvision.ops as ops
 import Constants
 from GIoULoss import GIoULoss
 import torch
+import torch.nn.functional as F
 
 
 
@@ -61,8 +62,236 @@ def apply_nms(pred_boxes, confidences, iou_threshold=0.5):
     return kept_boxes, kept_confidences
 
 
-def filter_and_trim_boxes(pred_boxes, target_boxes, max_boxes=Constants.max_boxes):
-    batch_size, grid_size, _, num_boxes, _ = pred_boxes.shape
+def assign_boxes(pred_boxes, target_boxes):
+    """
+    Assign each ground-truth box to the closest predicted box based on center distance.
+    
+    Parameters:
+        pred_boxes: Tensor of shape [batch_size, num_anchors, grid_h, grid_w, 4]
+        target_boxes: Tensor of shape [batch_size, max_gt_boxes, 4]
+    
+    Returns:
+        assigned_mask: Tensor of shape [batch_size, num_anchors, grid_h, grid_w]
+                    indicating which predicted boxes correspond to ground-truth boxes.
+    """
+    batch_size, num_anchors, grid_h, grid_w, _ = pred_boxes.shape
+    max_gt_boxes = target_boxes.shape[1]
+
+    # Calculate the centers of predicted and ground-truth boxes
+    pred_centers = (pred_boxes[..., :2] + pred_boxes[..., 2:4]) / 2  # (x1, y1) -> (center_x, center_y)
+    target_centers = (target_boxes[..., :2] + target_boxes[..., 2:4]) / 2  # Same for ground-truth
+
+    # Initialize an assignment mask (all False initially)
+    assigned_mask = torch.zeros((batch_size, num_anchors, grid_h, grid_w), dtype=torch.bool)
+
+    # Loop through each image in the batch
+    for b in range(batch_size):
+        for t in range(max_gt_boxes):
+            # Get the ground-truth box center for this box
+            gt_center = target_centers[b, t]
+
+            # Calculate the Euclidean distance between this GT box and all predicted boxes
+            distances = torch.sqrt(((pred_centers[b] - gt_center) ** 2).sum(dim=-1))  # [num_anchors, grid_h, grid_w]
+
+            # Find the anchor/grid cell with the smallest distance to the GT box
+            min_distance_idx = torch.argmin(distances)
+
+            # Mark this prediction as assigned to the ground-truth box
+            assigned_mask[b].view(-1)[min_distance_idx] = True
+
+    return assigned_mask
+
+
+
+def diou_batch(pred_boxes, target_boxes):
+    """Vectorized DIoU calculation between predictions and ground-truth boxes."""
+    # Expand dimensions for broadcasting: [batch_size, N, 1, 4], [batch_size, 1, M, 4]
+    pred_boxes = pred_boxes.unsqueeze(2)  # [batch_size, N, 1, 4]
+    target_boxes = target_boxes.unsqueeze(1)  # [batch_size, 1, M, 4]
+
+    # Intersection coordinates
+    inter_x1 = torch.max(pred_boxes[..., 0], target_boxes[..., 0])
+    inter_y1 = torch.max(pred_boxes[..., 1], target_boxes[..., 1])
+    inter_x2 = torch.min(pred_boxes[..., 2], target_boxes[..., 2])
+    inter_y2 = torch.min(pred_boxes[..., 3], target_boxes[..., 3])
+
+    inter_area = torch.clamp(inter_x2 - inter_x1, min=0) * torch.clamp(inter_y2 - inter_y1, min=0)
+    area1 = (pred_boxes[..., 2] - pred_boxes[..., 0]) * (pred_boxes[..., 3] - pred_boxes[..., 1])
+    area2 = (target_boxes[..., 2] - target_boxes[..., 0]) * (target_boxes[..., 3] - target_boxes[..., 1])
+    union_area = area1 + area2 - inter_area
+
+    iou = inter_area / (union_area + 1e-6)
+
+    # Center distances
+    pred_center_x = (pred_boxes[..., 0] + pred_boxes[..., 2]) / 2
+    pred_center_y = (pred_boxes[..., 1] + pred_boxes[..., 3]) / 2
+    target_center_x = (target_boxes[..., 0] + target_boxes[..., 2]) / 2
+    target_center_y = (target_boxes[..., 1] + target_boxes[..., 3]) / 2
+
+    center_dist = (pred_center_x - target_center_x) ** 2 + (pred_center_y - target_center_y) ** 2
+
+    # Enclosing box diagonal distance
+    enclose_x1 = torch.min(pred_boxes[..., 0], target_boxes[..., 0])
+    enclose_y1 = torch.min(pred_boxes[..., 1], target_boxes[..., 1])
+    enclose_x2 = torch.max(pred_boxes[..., 2], target_boxes[..., 2])
+    enclose_y2 = torch.max(pred_boxes[..., 3], target_boxes[..., 3])
+    enclose_dist = (enclose_x2 - enclose_x1) ** 2 + (enclose_y2 - enclose_y1) ** 2
+
+    return iou - (center_dist / (enclose_dist + 1e-6))  # DIoU formula
+
+
+def filter_and_trim_boxes(pred_boxes, target_boxes, max_boxes=Constants.max_boxes, iou_threshold=0.5):
+    batch_size, num_anchors, grid_h, grid_w, num_outputs = pred_boxes.shape
+
+    # Reshape predictions to [batch_size, N, 5]
+    pred_boxes = pred_boxes.view(batch_size, -1, 5)  # N = num_anchors * grid_h * grid_w
+    pred_coords = pred_boxes[..., :4]  # [batch_size, N, 4]
+    pred_confidences = pred_boxes[..., 4]  # [batch_size, N]
+
+    valid_mask = (target_boxes.sum(dim=-1) > 0)
+
+    filtered_target_boxes = []
+    filtered_pred_boxes = []
+    filtered_confidences = []
+
+    for i in range(batch_size):
+        valid_boxes = target_boxes[i][valid_mask[i]]
+        if valid_boxes.numel() == 0:
+            continue  # Skip if no valid boxes
+
+        # Compute DIoU between all predicted and valid ground-truth boxes
+        dious = diou(pred_coords[i], valid_boxes)  # [N, num_valid]
+
+        # Allow multiple matches based on threshold
+        matched_indices = (dious > iou_threshold).nonzero(as_tuple=True)
+
+        # If no matches exceed the threshold, fallback to the best DIoU
+        if matched_indices[0].numel() == 0:
+            best_matches = torch.argmax(dious, dim=0)
+            matched_indices = (best_matches, torch.arange(valid_boxes.shape[0]))
+
+        # Collect assigned predicted boxes and their confidences
+        assigned_mask = torch.zeros(pred_coords.shape[1], dtype=torch.bool, device=pred_coords.device)
+        assigned_mask[matched_indices[0]] = True
+
+        filtered_pred_coords = pred_coords[i][assigned_mask]
+        filtered_confidences_flat = pred_confidences[i][assigned_mask].unsqueeze(-1)
+
+        filtered_target_boxes.append(valid_boxes)
+        filtered_pred_boxes.append(filtered_pred_coords)
+        filtered_confidences.append(filtered_confidences_flat)
+
+    # Concatenate results across the batch
+    target_boxes_flat = torch.cat(filtered_target_boxes, dim=0)
+    pred_boxes_flat = torch.cat(filtered_pred_boxes, dim=0)
+    confidences_flat = torch.cat(filtered_confidences, dim=0)
+
+    return target_boxes_flat, pred_boxes_flat, confidences_flat
+
+
+
+
+def filter_and_trim_boxes4(pred_boxes, target_boxes, max_boxes=Constants.max_boxes, iou_threshold=0.5):
+    batch_size, num_anchors, grid_h, grid_w, num_outputs = pred_boxes.shape
+
+    # Reshape predictions to [batch_size, N, 5]
+    pred_boxes = pred_boxes.view(batch_size, -1, 5)
+    pred_coords = pred_boxes[..., :4]
+    pred_confidences = pred_boxes[..., 4]
+
+    valid_mask = (target_boxes.sum(dim=-1) > 0)
+
+    filtered_target_boxes = []
+    filtered_pred_boxes = []
+    filtered_confidences = []
+
+    for i in range(batch_size):
+        valid_boxes = target_boxes[i][valid_mask[i]]
+        if valid_boxes.numel() == 0:
+            continue  # Skip if no valid boxes
+
+        # Compute DIoU between all predicted and valid ground-truth boxes
+        dious = diou(pred_coords[i], valid_boxes)  # [N, num_valid]
+
+        # Allow multiple matches based on threshold
+        matched_indices = (dious > iou_threshold).nonzero(as_tuple=True)
+
+        # If no matches exceed the threshold, fallback to the best DIoU
+        if matched_indices[0].numel() == 0:
+            best_matches = torch.argmax(dious, dim=0)
+            matched_indices = (best_matches, torch.arange(valid_boxes.shape[0]))
+
+        # Collect assigned predicted boxes and their confidences
+        assigned_mask = torch.zeros(pred_coords.shape[1], dtype=torch.bool, device=pred_coords.device)
+        assigned_mask[matched_indices[0]] = True
+
+        filtered_pred_coords = pred_coords[i][assigned_mask]
+        filtered_confidences_flat = pred_confidences[i][assigned_mask].unsqueeze(-1)
+
+        filtered_target_boxes.append(valid_boxes)
+        filtered_pred_boxes.append(filtered_pred_coords)
+        filtered_confidences.append(filtered_confidences_flat)
+
+    # Concatenate results across the batch
+    target_boxes_flat = torch.cat(filtered_target_boxes, dim=0)
+    pred_boxes_flat = torch.cat(filtered_pred_boxes, dim=0)
+    confidences_flat = torch.cat(filtered_confidences, dim=0)
+
+    return target_boxes_flat, pred_boxes_flat, confidences_flat
+
+def filter_and_trim_boxes3(pred_boxes, target_boxes, max_boxes=Constants.max_boxes, iou_threshold=0.5):
+    batch_size, num_anchors, grid_h, grid_w, num_outputs = pred_boxes.shape
+
+    # Reshape predictions to [batch_size, num_anchors * grid_h * grid_w, 5]
+    pred_boxes = pred_boxes.view(batch_size, -1, 5)
+    pred_coords = pred_boxes[..., :4]  # [batch_size, N, 4]
+    pred_confidences = pred_boxes[..., 4]  # [batch_size, N]
+
+    valid_mask = (target_boxes.sum(dim=-1) > 0)  # Mask to filter valid ground-truth boxes
+
+    filtered_target_boxes = []
+    filtered_pred_boxes = []
+    filtered_confidences = []
+
+    for i in range(batch_size):
+        valid_boxes = target_boxes[i][valid_mask[i]]  # [num_valid, 4]
+        num_valid = valid_boxes.shape[0]
+
+        assigned_mask = torch.zeros(pred_coords.shape[1], dtype=torch.bool)
+
+        for t in range(num_valid):
+            gt_box = valid_boxes[t].unsqueeze(0)  # [1, 4]
+            dious = diou(pred_coords[i], gt_box)  # [N]
+
+            # Allow multiple anchors to match if DIoU exceeds the threshold
+            matched_indices = torch.where(dious > iou_threshold)[0]
+
+            # If no valid match is found, fall back to the best DIoU
+            if len(matched_indices) == 0:
+                best_match = torch.argmax(dious)
+                matched_indices = torch.tensor([best_match], dtype=torch.long)
+
+            # Mark these predictions as assigned
+            assigned_mask[matched_indices] = True
+
+        # Collect assigned predicted boxes and their confidences
+        filtered_pred_coords = pred_coords[i][assigned_mask]  # Tensor [num_assigned, 4]
+        filtered_confidences_flat = pred_confidences[i][assigned_mask].unsqueeze(-1)  # Tensor [num_assigned, 1]
+
+        # Append the filtered results for this image
+        filtered_target_boxes.append(valid_boxes)
+        filtered_pred_boxes.append(filtered_pred_coords)
+        filtered_confidences.append(filtered_confidences_flat)
+
+    # Concatenate results across all images in the batch
+    target_boxes_flat = torch.cat(filtered_target_boxes, dim=0)  # [total_valid, 4]
+    pred_boxes_flat = torch.cat(filtered_pred_boxes, dim=0)      # [total_valid, 4]
+    confidences_flat = torch.cat(filtered_confidences, dim=0)    # [total_valid, 1]
+
+    return target_boxes_flat, pred_boxes_flat, confidences_flat
+
+def filter_and_trim_boxes2(pred_boxes, target_boxes, max_boxes=Constants.max_boxes):
+    batch_size, num_anchors, grid_h, grid_w, num_outputs = pred_boxes.shape
 
     # Reshape pred_boxes to [batch_size, grid_size * grid_size * num_boxes, 5]
     pred_boxes = pred_boxes.view(batch_size, -1, 5)
@@ -79,6 +308,12 @@ def filter_and_trim_boxes(pred_boxes, target_boxes, max_boxes=Constants.max_boxe
     filtered_pred_boxes = []
     filtered_confidences = []
 
+                # Calculate the centers of predicted and ground-truth boxes
+    pred_centers = (pred_boxes[..., :2] + pred_boxes[..., 2:4]) / 2  # (x1, y1) -> (center_x, center_y)
+    target_centers = (target_boxes[..., :2] + target_boxes[..., 2:4]) / 2  # Same for ground-truth
+
+        # Initialize an assignment mask (all False initially)
+
     for i in range(batch_size):
         # Get valid target boxes for the current image
         valid_boxes = target_boxes[i][valid_mask[i]]  # Shape: [num_valid, 4]
@@ -86,20 +321,38 @@ def filter_and_trim_boxes(pred_boxes, target_boxes, max_boxes=Constants.max_boxe
         # Number of valid target boxes
         num_valid = valid_boxes.shape[0]
 
+        assigned_mask = torch.zeros((num_anchors * grid_h * grid_w,), dtype=torch.bool)
+
+        for t in range(num_valid):
+            # Get the ground-truth box center for this box
+            gt_center = target_centers[i, t]
+
+            # Calculate the Euclidean distance between this GT box and all predicted boxes
+            distances = torch.sqrt(((pred_centers[i] - gt_center) ** 2).sum(dim=-1))  # [num_anchors, grid_h, grid_w]
+
+            # Find the anchor/grid cell with the smallest distance to the GT box
+            min_distance_idx = torch.argmin(distances)
+
+            # Mark this prediction as assigned to the ground-truth box
+            assigned_mask[min_distance_idx] = True
+
         # Sort predicted boxes by confidence (descending)
-        _, topk_indices = torch.topk(pred_confidences[i], num_valid, largest=True)
+        #_, topk_indices = torch.topk(pred_confidences[i], num_valid, largest=True)
 
         # Select the top-k most confident predicted boxes and their confidences
-        filtered_pred_coords = pred_coords[i][topk_indices]  # Shape: [num_valid, 4]
-        filtered_confidences_flat = pred_confidences[i][topk_indices].unsqueeze(-1)  # [num_valid, 1]
+        #filtered_pred_coords = pred_coords[i][topk_indices]  # Shape: [num_valid, 4]
+        #filtered_confidences_flat = pred_confidences[i][topk_indices].unsqueeze(-1)  # [num_valid, 1]
 
-        refiltered_pred_boxes, refiltered_confidences = filter_confidences(filtered_pred_coords, filtered_confidences_flat)
-        nmsfiltered_pred_boxes, nmsfiltered_confidences = apply_nms(refiltered_pred_boxes, refiltered_confidences)
+        #refiltered_pred_boxes, refiltered_confidences = filter_confidences(filtered_pred_coords, filtered_confidences_flat)
+        #nmsfiltered_pred_boxes, nmsfiltered_confidences = apply_nms(refiltered_pred_boxes, refiltered_confidences)
+        # Collect assigned predicted boxes and their confidences
+        filtered_pred_coords = pred_coords [i][assigned_mask]  # Tensor [num_assigned, 4]
+        filtered_confidences_flat = pred_confidences[i][assigned_mask].unsqueeze(-1)  # Tensor [num_assigned, 1]
 
         # Append the filtered results for this image
         filtered_target_boxes.append(valid_boxes)
-        filtered_pred_boxes.append(nmsfiltered_pred_boxes)
-        filtered_confidences.append(nmsfiltered_confidences)
+        filtered_pred_boxes.append(filtered_pred_coords)
+        filtered_confidences.append(filtered_confidences_flat)
 
 
 
@@ -113,31 +366,145 @@ def filter_and_trim_boxes(pred_boxes, target_boxes, max_boxes=Constants.max_boxe
 
     return target_boxes_flat, pred_boxes_flat, confidences_flat
 
-def postprocess_yolo_output(output, loaded_anchor_boxes, stride=(Constants.desired_size/16)):
-    batch_size, height, width, num_boxes, _ = output.shape
-    cx, cy = generate_grid_indices(height, width, output.device)
+def diou2(box1, box2):
+    """Compute DIoU between two sets of boxes."""
+    # Intersection coordinates
+    inter_x1 = torch.max(box1[..., 0], box2[..., 0])
+    inter_y1 = torch.max(box1[..., 1], box2[..., 1])
+    inter_x2 = torch.min(box1[..., 2], box2[..., 2])
+    inter_y2 = torch.min(box1[..., 3], box2[..., 3])
+
+    # Intersection and union areas
+    inter_area = torch.clamp(inter_x2 - inter_x1, min=0) * torch.clamp(inter_y2 - inter_y1, min=0)
+    area1 = (box1[..., 2] - box1[..., 0]) * (box1[..., 3] - box1[..., 1])
+    area2 = (box2[..., 2] - box2[..., 0]) * (box2[..., 3] - box2[..., 1])
+    union_area = area1 + area2 - inter_area
+
+    # IoU calculation
+    iou = inter_area / union_area
+
+    # Compute the center distance
+    center_x1 = (box1[..., 0] + box1[..., 2]) / 2
+    center_y1 = (box1[..., 1] + box1[..., 3]) / 2
+    center_x2 = (box2[..., 0] + box2[..., 2]) / 2
+    center_y2 = (box2[..., 1] + box2[..., 3]) / 2
+
+    dist = (center_x1 - center_x2) ** 2 + (center_y1 - center_y2) ** 2
+
+    # Compute the diagonal of the smallest enclosing box
+    enclose_x1 = torch.min(box1[..., 0], box2[..., 0])
+    enclose_y1 = torch.min(box1[..., 1], box2[..., 1])
+    enclose_x2 = torch.max(box1[..., 2], box2[..., 2])
+    enclose_y2 = torch.max(box1[..., 3], box2[..., 3])
+    diag = (enclose_x2 - enclose_x1) ** 2 + (enclose_y2 - enclose_y1) ** 2
+
+    return iou - (dist / diag)  # DIoU formula
+
+def diou(boxes1, boxes2):
+    """Compute DIoU between two sets of boxes in a vectorized manner."""
+    # Ensure boxes1 and boxes2 have the same shape for broadcasting
+    boxes1 = boxes1.unsqueeze(1)  # [batch_size, N, 1, 4]
+    boxes2 = boxes2.unsqueeze(0)  # [1, num_valid, 4]
+
+    # Intersection coordinates
+    inter_x1 = torch.max(boxes1[..., 0], boxes2[..., 0])
+    inter_y1 = torch.max(boxes1[..., 1], boxes2[..., 1])
+    inter_x2 = torch.min(boxes1[..., 2], boxes2[..., 2])
+    inter_y2 = torch.min(boxes1[..., 3], boxes2[..., 3])
+
+    # Intersection and union areas
+    inter_area = torch.clamp(inter_x2 - inter_x1, min=0) * torch.clamp(inter_y2 - inter_y1, min=0)
+    area1 = (boxes1[..., 2] - boxes1[..., 0]) * (boxes1[..., 3] - boxes1[..., 1])
+    area2 = (boxes2[..., 2] - boxes2[..., 0]) * (boxes2[..., 3] - boxes2[..., 1])
+    union_area = area1 + area2 - inter_area
+
+    # IoU calculation
+    iou = inter_area / (union_area + 1e-6)
+
+    # Center distances
+    center_x1 = (boxes1[..., 0] + boxes1[..., 2]) / 2
+    center_y1 = (boxes1[..., 1] + boxes1[..., 3]) / 2
+    center_x2 = (boxes2[..., 0] + boxes2[..., 2]) / 2
+    center_y2 = (boxes2[..., 1] + boxes2[..., 3]) / 2
+    center_dist = (center_x1 - center_x2) ** 2 + (center_y1 - center_y2) ** 2
+
+    # Diagonal distance of the smallest enclosing box
+    enclose_x1 = torch.min(boxes1[..., 0], boxes2[..., 0])
+    enclose_y1 = torch.min(boxes1[..., 1], boxes2[..., 1])
+    enclose_x2 = torch.max(boxes1[..., 2], boxes2[..., 2])
+    enclose_y2 = torch.max(boxes1[..., 3], boxes2[..., 3])
+    enclose_dist = (enclose_x2 - enclose_x1) ** 2 + (enclose_y2 - enclose_y1) ** 2
+
+    return iou - (center_dist / (enclose_dist + 1e-6))  # DIoU formula
+
+def postprocess_yolo_output2(output, loaded_anchor_boxes, stride=(Constants.desired_size / 16)):
+    # Unpack the output shape
+    batch_size, num_anchors, grid_height, grid_width, num_outputs = output.shape
+
+    # Generate grid indices (center positions) for each grid cell
+    cx = torch.arange(grid_width, device=output.device).view(1, 1, 1, grid_width, 1).expand(batch_size, num_anchors, grid_height, grid_width, 1)
+    cy = torch.arange(grid_height, device=output.device).view(1, 1, grid_height, 1, 1).expand(batch_size, num_anchors, grid_height, grid_width, 1)
 
     # Apply sigmoid to normalize x, y coordinates
     output[..., 0:2] = torch.sigmoid(output[..., 0:2])
 
+    # Adjust x and y coordinates relative to each grid cell
+    output[..., 0] += cx.squeeze(-1)  # x-coordinates
+    output[..., 1] += cy.squeeze(-1)  # y-coordinates
+
+    # Convert x, y from grid index to absolute pixel values
+    output[..., 0] *= stride
+    output[..., 1] *= stride
+
+    # Ensure anchor boxes are correctly applied
+    if loaded_anchor_boxes is not None and len(loaded_anchor_boxes) == num_anchors:
+        # Reshape anchors: [1, num_anchors, 1, 1, 2] -> Anchor widths and heights
+        anchors = loaded_anchor_boxes.view(1, num_anchors, 1, 1, 2)
+
+        # Split anchors into widths and heights
+        anchor_widths = anchors[..., 0].expand(batch_size, num_anchors, grid_height, grid_width, 1)
+        anchor_heights = anchors[..., 1].expand(batch_size, num_anchors, grid_height, grid_width, 1)
+
+        # Apply the exponential function to predict width and height
+        output[..., 2] = torch.exp(output[..., 2]) * anchor_widths * Constants.desired_size
+        output[..., 3] = torch.exp(output[..., 3]) * anchor_heights * Constants.desired_size
+    else:
+        raise ValueError("Anchor boxes are not configured correctly.")
+
+    # Apply sigmoid to the object confidence scores
+    output[..., 4] = torch.sigmoid(output[..., 4])
+
+    return output
+
+
+
+def postprocess_yolo_output(output, loaded_anchor_boxes):
+    batch_size, num_anchors, grid_height, grid_width, num_outputs = output.shape
+    stride=(Constants.desired_size/grid_height)
+
+    cx, cy = generate_grid_indices(grid_height, grid_width, output.device)
+
+    # Apply sigmoid to normalize x, y coordinates
+    output[..., 0:2] = torch.sigmoid(output[..., 0:2])
+
+        # Expand cx and cy to match output tensor shape
+    cx = cx.unsqueeze(0).unsqueeze(0).expand(batch_size, num_anchors, grid_height, grid_width).to(output.device)
+    cy = cy.unsqueeze(0).unsqueeze(0).expand(batch_size, num_anchors, grid_height, grid_width).to(output.device)
+
     # Adjust x and y to be the center of each cell:
-    output[..., 0] += cx.unsqueeze(-1)  # Add grid x indices for each box
-    output[..., 1] += cy.unsqueeze(-1)  # Add grid y indices for each box
+    output[..., 0] += cx  # Add grid x indices for each box
+    output[..., 1] += cy  # Add grid y indices for each box
 
     # Convert x, y from grid index to absolute pixel values
     output[..., 0] *= stride
     output[..., 1] *= stride
 
     # Adjust widths and heights from the anchor boxes
-    if loaded_anchor_boxes is not None and len(loaded_anchor_boxes) == num_boxes:
-        # Assuming anchor boxes is a tensor of shape [5, 2] (5 anchor boxes, each with width and height)
-        anchor_widths = loaded_anchor_boxes[:, 0].unsqueeze(0).unsqueeze(1).unsqueeze(1).unsqueeze(-1)
-        anchor_heights = loaded_anchor_boxes[:, 1].unsqueeze(0).unsqueeze(1).unsqueeze(1).unsqueeze(-1)
-        # Shape becomes [1, 1, 1, 5, 1] to match [batch_size, height, width, num_boxes, 1]
-
-        # Now, expand anchor_widths to match the output dimensions
-        anchor_widths = anchor_widths.expand(batch_size, height, width, num_boxes, 1)
-        anchor_heights = anchor_heights.expand(batch_size, height, width, num_boxes, 1)
+    if loaded_anchor_boxes is not None and len(loaded_anchor_boxes) == num_anchors:
+        loaded_anchor_boxes = loaded_anchor_boxes.to(output.device)
+        # Expand anchor widths and heights to match output shape [64, 5, 40, 40, 1]
+        anchor_widths = loaded_anchor_boxes[:, 0].view(1, 5, 1, 1, 1).expand(output.shape[0], output.shape[1], output.shape[2], output.shape[3], 1)
+        anchor_heights = loaded_anchor_boxes[:, 1].view(1, 5, 1, 1, 1).expand(output.shape[0], output.shape[1], output.shape[2], output.shape[3], 1)
 
         output[..., 2] = (torch.exp(output[..., 2]).unsqueeze(-1) * anchor_widths * Constants.desired_size).squeeze(-1)
         output[..., 3] = (torch.exp(output[..., 3]).unsqueeze(-1) * anchor_heights * Constants.desired_size).squeeze(-1)
@@ -468,8 +835,8 @@ class CombinedLoss(nn.Module):
 
 
         self.IoUScale = 1 # Weight of IoU loss
-        self.DIoUScale = 0 #Weight of DIoU loss
-        self.SmoothL1LossScale = 1 #Weight of SmoothL1Loss
+        self.DIoUScale = 0.2 #Weight of DIoU loss
+        self.SmoothL1LossScale = 2 #Weight of SmoothL1Loss
 
 
         self.confidenceScale = 1.0 #Weight of our Confidence levels
@@ -480,8 +847,10 @@ class CombinedLoss(nn.Module):
 
         self.negativePenaltyWeight = 0.2
 
-        self.GoodMultiplier = 2
-        self.BadMultiplier = 1.2
+        self.GoodMultiplier = 3
+        self.BadMultiplier = 2.25
+
+        self.outOfBoundsPenaltyScale = 0.0075
 
     def updateAlpha(self, alpha):
         self.alpha = alpha
@@ -492,6 +861,8 @@ class CombinedLoss(nn.Module):
 
     def forward(self, pred_boxes, target_boxes, writer, step=-1):
 
+
+        
         #ConfidencePenalty = self.confidencePenalty(pred_boxes[..., 4:5])
         if False:
             print()
@@ -501,7 +872,6 @@ class CombinedLoss(nn.Module):
 
         negative_width_penalty = torch.clamp(-pred_width, min=0)  # Only penalize if < 0
         negative_height_penalty = torch.clamp(-pred_height, min=0)  # Only penalize if < 0
-
 
 
 
@@ -522,6 +892,24 @@ class CombinedLoss(nn.Module):
         #pred_boxes[:, 3] = torch.clamp(pred_boxes[:, 3], min=1)  # Clamp height
 
         pred_boxes = yolo_to_corners(pred_boxes, self.anchor_boxes)
+
+
+        # Extract x1, y1, x2, y2 from pred_boxes
+        x1 = pred_boxes[..., 0]
+        y1 = pred_boxes[..., 1]
+        x2 = pred_boxes[..., 2]
+        y2 = pred_boxes[..., 3]
+
+        # Apply ReLU-based penalty for out-of-bounds values
+        x1_penalty = torch.relu(-x1)  # Penalize if x1 < 0
+        y1_penalty = torch.relu(-y1)  # Penalize if y1 < 0
+        x2_penalty = torch.relu(x2 - Constants.desired_size)  # Penalize if x2 > desired_size
+        y2_penalty = torch.relu(y2 - Constants.desired_size)  # Penalize if y2 > desired_size
+
+        # Combine all penalties
+        outOfBoundsPenalty = 0#(torch.mean(x1_penalty ** 2 + y1_penalty ** 2 + x2_penalty ** 2 + y2_penalty ** 2)/Constants.desired_size) * self.outOfBoundsPenaltyScale
+
+
 
 
         _, target_boxes = clipBoxes(pred_boxes,target_boxes)
@@ -577,34 +965,38 @@ class CombinedLoss(nn.Module):
             print(f"An error occurred: {e}")
 
         
-        smooth_l1_loss_value = smooth_l1_loss_value * mask.unsqueeze(1)
+        #smooth_l1_loss_value = smooth_l1_loss_value
         iou_loss_value = iou_loss_value * mask.float()
         diou_loss_value = diou_loss_value * mask.float()
+        confidences_scaled = confidences_scaled.squeeze(-1) * mask.float()
 
         #scale
         iou_loss_value_scaled = iou_loss_value * self.IoUScale
         diou_loss_value_scaled = diou_loss_value * self.DIoUScale
-        smooth_l1_loss_scaled = (smooth_l1_loss_value * self.SmoothL1LossScale).mean(dim=1, keepdim=True)
-
+        smooth_l1_loss_scaled = (smooth_l1_loss_value * self.SmoothL1LossScale).mean(dim=1, keepdim=True).squeeze(-1) * mask
 
         maxLoss = self.IoUScale + self.DIoUScale + self.SmoothL1LossScale
-        x = (iou_loss_value_scaled + diou_loss_value + smooth_l1_loss_scaled)/mask.float().sum()
-        y= confidences_scaled/mask.float().sum()
+        x = (iou_loss_value_scaled + diou_loss_value_scaled + smooth_l1_loss_scaled).sum()/mask.float().sum()
+        y= confidences_scaled.sum()/mask.float().sum()
 
 
 
         # Loss formula
+        #Distance from perfect and confident (Lower the more perfect we are)
         good_loss = torch.sqrt((0 - x)**2 + (1 - y)**2) * self.GoodMultiplier
+
+        #Distance from Confidently wrong. (Higher the more confidently wrong.)
         bad_loss = torch.sqrt((maxLoss - x)**2 + (1 - y)**2) * self.BadMultiplier
 
-        # Final loss calculation
+        # Final loss calculation. Distance from perfect minus distance from opposite of perfect
         losses = good_loss - bad_loss
         
         losses = losses
-        losses = torch.clamp(losses + (maxLoss * self.BadMultiplier), min=0).mean()
+        losses = torch.clamp(losses + (maxLoss * self.BadMultiplier), min=0)
         #losses = loss (self.IoUScale + self.DIoUScale + self.SmoothL1LossScale) - ((diou_loss_value_scaled + iou_loss_value_scaled + smooth_l1_loss_scaled) * confidences_scaled).mean()
 
-        
+        print("Losses: ", end="")
+        print(good_loss.item(), bad_loss.item(), losses.item(), end=" ")
         #Scale total losses with confidence
 
         negative_penalty_loss = (negative_width_penalty + negative_height_penalty).mean() * self.negativePenaltyWeight
@@ -613,6 +1005,7 @@ class CombinedLoss(nn.Module):
             writer.add_scalar('avg Confidence', confidences_flat.mean(), step)
             writer.add_scalar('avg Coordinate', pred_boxes.mean(), step)
             writer.add_scalar('Negative Penalty', negative_penalty_loss, step)
+            writer.add_scalar('Too Big Penalty', outOfBoundsPenalty, step)
             #writer.add_scalar('iou_loss_value', iou_loss_value_scaled.mean(), step)
             writer.add_scalar('diou_loss_value', diou_loss_value_scaled.mean(), step)
             writer.add_scalar('smooth_l1_loss_value', smooth_l1_loss_scaled.mean(), step)
@@ -623,7 +1016,7 @@ class CombinedLoss(nn.Module):
 
             
         # Compute the final mean loss, ignoring 0-confidence boxes
-        final_loss = losses + negative_penalty_loss# + penalty_scalled  # Avoid division by 0
+        final_loss = losses + negative_penalty_loss + outOfBoundsPenalty# + penalty_scalled  # Avoid division by 0
 
         # Log percentages (for debugging/monitoring)
         #total_loss = diou_loss_value_scaled + iou_loss_value_scaled + penalty_scaled
@@ -634,4 +1027,38 @@ class CombinedLoss(nn.Module):
 
         return final_loss
     
+
+    def yolo_loss(self, pred_boxes, pred_conf, pred_classes, target_boxes, target_classes, target_mask):
+        """
+        Compute the YOLO loss for a batch of images.
+        
+        pred_boxes: Tensor of shape [batch_size, num_anchors, grid_h, grid_w, 4]
+        pred_conf: Tensor of shape [batch_size, num_anchors, grid_h, grid_w]
+        pred_classes: Tensor of shape [batch_size, num_anchors, grid_h, grid_w, num_classes]
+        
+        target_boxes: Tensor of shape [batch_size, max_gt_boxes, 4]
+        target_classes: Tensor of shape [batch_size, max_gt_boxes]
+        target_mask: Tensor indicating which predictions correspond to ground truth.
+        """
+
+        # 1. Compute Objectness Loss (BCE Loss)
+        objectness_loss = F.binary_cross_entropy_with_logits(
+            pred_conf, target_mask, reduction='mean'
+        )
+
+        # 2. Compute Localization Loss (DIoU or SmoothL1 Loss) for assigned boxes
+        assigned_pred_boxes = pred_boxes[target_mask]
+        assigned_target_boxes = target_boxes[target_mask]
+        loc_loss = F.smooth_l1_loss(assigned_pred_boxes, assigned_target_boxes, reduction='mean')
+
+        # 3. Compute Classification Loss (only for positive boxes)
+        assigned_pred_classes = pred_classes[target_mask]
+        assigned_target_classes = target_classes[target_mask]
+        class_loss = F.cross_entropy(assigned_pred_classes, assigned_target_classes, reduction='mean')
+
+        # 4. Combine all losses with appropriate weights
+        total_loss = loc_loss + objectness_loss + class_loss
+
+        return total_loss
+
 

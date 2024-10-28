@@ -120,4 +120,4 @@ anchor_boxes = kmeans.cluster_centers_.tolist()
 with open('anchor_boxes.json', 'w') as file:
     json.dump(anchor_boxes, file, indent=4)
 
-perform_elbow_method(data_for_clustering)
+#perform_elbow_method(data_for_clustering)

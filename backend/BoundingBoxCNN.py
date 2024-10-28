@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader
 import torchvision.transforms.functional as F
 from GIoULoss import GIoULoss
 import DisplayImage
+from yolov5.models.yolo import Detect
 from customDataSet import CustomImageDataset
 import torchvision.ops as ops
 from transforms import ResizeToMaxDimension
@@ -22,7 +23,7 @@ from torch.optim.lr_scheduler import SequentialLR, LinearLR, ReduceLROnPlateau
 from torch.utils.tensorboard import SummaryWriter
 import torch.multiprocessing as mp
 import gc
-from ultralytics.yolo.models.yolo import Detect
+#from yolov5 import detect
 
 
 
@@ -404,7 +405,7 @@ def apply_nms(pred_boxes, confidences, iou_threshold=0.5):
     - kept_confidences: Tensor of confidence scores of kept boxes, shape [K, 1] where K is the number of boxes kept.
     """
     # Apply NMS using the confidences squeezed to one dimension for proper NMS functionality
-    keep_indices = torchvision.ops.nms(pred_boxes, confidences.squeeze(), iou_threshold)
+    keep_indices = torchvision.ops.nms(pred_boxes, confidences.squeeze(1), iou_threshold)
 
     # Index the results with keep_indices. The result for boxes is straightforward.
     kept_boxes = pred_boxes[keep_indices]
@@ -416,6 +417,7 @@ def apply_nms(pred_boxes, confidences, iou_threshold=0.5):
 
 
 def train(model, loader, criterion, optimizer, optionalLoader=None):
+    model = model.to(device)
     model.train()  # Set the model to training mode
     running_loss = 0.0
     total = 0
@@ -443,18 +445,21 @@ def train(model, loader, criterion, optimizer, optionalLoader=None):
         # Forward pass: compute model outputs (bounding box coordinates)
         i+=1
 
-        if (batch_idx == 1 or batch_idx % 30 == 0) and False:
+        if (batch_idx == 1 or batch_idx % 30 == 0) and True:
             image, bbox, path = get_nth_image(optionalLoader, 1)
             image = image.to(device)
             image = image.unsqueeze(0)
             bbox = bbox.to(device)
             bbox = bbox.unsqueeze(0)
             output = model(image)
+            output = output[1][..., :5]
             output = postprocess_yolo_output(output,loaded_anchor_boxes)
-            bbox, output, _ = filter_and_trim_boxes(output, bbox)
+            bbox, output, c = filter_and_trim_boxes(output, bbox)
             bbox = fix_box_coordinates(bbox)
             _, bbox = clipBoxes(output,bbox)
             output =  yolo_to_corners(output, loaded_anchor_boxes)
+            output, c = apply_nms(output, c)
+            output, c = filter_confidences(output, c)
             DisplayImage.draw_bounding_boxes(path, bbox, output, epoch+1, batch_idx, transform)
 
 
@@ -465,7 +470,7 @@ def train(model, loader, criterion, optimizer, optionalLoader=None):
         images = images.to(device)
         bboxes = bboxes.to(device)
         outputs = model(images)
-
+        outputs[1] = outputs[1][..., :5]
 
         #writer.add_scalar('Avg output', outputs[1].mean(), epoch * len(train_loader) + batch_idx)
         if False:
@@ -485,9 +490,9 @@ def train(model, loader, criterion, optimizer, optionalLoader=None):
         # Accumulate the loss for the current batch
         running_loss += loss.item() * images.size(0)
         total += images.size(0)
-
+        print(str(running_loss/total))
         # Calculate IoU for the batch
-        outputs_trimmed = outputs[..., :4]
+        outputs_trimmed = outputs[1][..., :4]
         outputs_flat = outputs_trimmed.view(-1, 4)
         avg_batch_iou  = 0#calculate_valid_iou(outputs_flat, bboxes.view(-1,4))  # IoU between predicted and true boxes
         #avg_batch_iou = batch_iou.diag().mean().item()  # Average IoU for the batch
@@ -497,9 +502,9 @@ def train(model, loader, criterion, optimizer, optionalLoader=None):
 
     print()
     # Average loss and IoU per epoch
-    for name, param in model.named_parameters():
-        if param.grad is not None:
-            print(f"{name}: {param.grad.norm()}")
+    #for name, param in model.named_parameters():
+        #if param.grad is not None:
+            #print(f"{name}: {param.grad.norm()}")
     epoch_loss = running_loss / total
     epoch_iou = 100 * (total_iou / total)
     return epoch_loss, epoch_iou
@@ -660,7 +665,8 @@ def compute_max_boxes(dataloader):
     return max_boxes
 
 weight_decay = 1e-5
-learning_rate = 0.001
+learning_rate = 0.00005
+learning_rate = 0.0005
 alpha=.5
 batch_size = 64
 desired_size=Constants.desired_size
@@ -699,7 +705,7 @@ if __name__ == "__main__":
 
             torch.set_printoptions(sci_mode=False, precision=4)
             
-
+            torch.autograd.set_detect_anomaly(True)
             train_dataset=CustomImageDataset(img_dir='./backend/training_data/', transform=transform, train=True)
             test_dataset=CustomImageDataset(img_dir='./backend/training_data/', transform=transform, train=False)
 
@@ -731,33 +737,42 @@ if __name__ == "__main__":
             cnn_model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=False).to(device)
 
 
-            # Set the number of classes to 1 (text detection)
-            cnn_model.model[-1].nc = 1  # Number of classes
-            cnn_model.names = ['text']   # Set the name of the class
 
-            # Define custom anchors (rescaled to match feature map size if needed)
-            anchors = torch.tensor([
-                [0.024182299094176685, 0.01957318537345516],
-                [0.09786826265627355, 0.20256818319648476],
-                [0.5129500743621527, 0.168960742084272],
-                [0.20809382877536947, 0.06999777642032576],
-                [0.07783910534023361, 0.042507661604262496]
-            ], dtype=torch.float32).view(1, -1, 2)
 
-            # Apply the custom anchors to the model's Detect layer
-            cnn_model.model[-1].anchors = anchors
-            cnn_model.model[-1].na = 5  # Number of anchors
-            cnn_model.model[-1].no = 6  # (5 + 1) = 6 outputs per anchor (bbox + conf + class)
-            
-            cnn_model.model[-1] = detect(
-                nc=1,  # 1 class (text detection)
-                anchors=anchors,
-                ch=[128, 256, 512]  # Input channels from the previous layers
-            )
+
+            # Access the Detect layer
+            detect_layer = cnn_model.model[-1]
+
+            # Ensure it's configured with the correct number of anchors and outputs
+            detect_layer.nc = 1  # 1 class (text)
+            detect_layer.na = 5  # 5 anchors
+            detect_layer.no = 6  # 4 bbox + 1 confidence + 1 class = 6 outputs per anchor
+
+            # Apply the custom anchors to the Detect layer
+            detect_layer.anchors = loaded_anchor_boxes
+
+            # Update the Conv2d layers in the Detect module to output 30 channels
+            for i, layer in enumerate(detect_layer.m):
+                in_channels = layer.in_channels
+                detect_layer.m[i] = torch.nn.Conv2d(in_channels, 5 * 6, kernel_size=1)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
             max_norm = 5
             #criterion = nn.CrossEntropyLoss()
-            criterion = CombinedLoss(anchor_boxes=anchors).to(device)#nn.SmoothL1Loss().to(device)#CombinedLoss().to(device)
+            criterion = CombinedLoss(anchor_boxes=loaded_anchor_boxes).to(device)#nn.SmoothL1Loss().to(device)#CombinedLoss().to(device)
             optimizer = optim.Adam(cnn_model.parameters(), lr=learning_rate, weight_decay=weight_decay) #, weight_decay=5e-4
             # Warm-up scheduler for the first 10 epochs
             #warmup_scheduler = LinearLR(optimizer, start_factor=0.01, total_iters=10)
@@ -823,7 +838,7 @@ if __name__ == "__main__":
                 epoch += 1
 
 
-            del test_loader
+            #del test_loader
             del train_loader
             del train_dataset
             del test_dataset
