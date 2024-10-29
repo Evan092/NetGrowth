@@ -454,13 +454,18 @@ def train(model, loader, criterion, optimizer, optionalLoader=None):
             output = model(image)
             output = output[1][..., :5]
             output = postprocess_yolo_output(output,loaded_anchor_boxes)
-            bbox, output, c = filter_and_trim_boxes(output, bbox)
+            #bbox, output, c = filter_and_trim_boxes(output, bbox)
+            pred_boxes = output.reshape(1, -1, 5)  # N = num_anchors * grid_h * grid_w
+            pred_coords = pred_boxes[..., :4]  # [batch_size, N, 4]
+            pred_confidences = pred_boxes[..., 4]  # [batch_size, N]
+            pred_confidences = pred_confidences.view(-1, 1)
             bbox = fix_box_coordinates(bbox)
-            _, bbox = clipBoxes(output,bbox)
-            output =  yolo_to_corners(output, loaded_anchor_boxes)
-            output, c = apply_nms(output, c)
-            output, c = filter_confidences(output, c)
-            DisplayImage.draw_bounding_boxes(path, bbox, output, epoch+1, batch_idx, transform)
+            _, bbox = clipBoxes(pred_coords,bbox)
+            pred_coords =  yolo_to_corners(pred_coords.squeeze(0), loaded_anchor_boxes)
+            pred_coords, pred_confidences = filter_confidences(pred_coords, pred_confidences)
+            pred_coords, pred_confidences = apply_nms(pred_coords, pred_confidences)
+            DisplayImage.draw_bounding_boxes(path, bbox, pred_coords, epoch+1, batch_idx, transform)
+            print("Image taken",epoch+1, batch_idx, pred_coords.shape[0])
 
 
         percentage = (i / len(loader)) * 100
@@ -666,9 +671,9 @@ def compute_max_boxes(dataloader):
 
 weight_decay = 1e-5
 learning_rate = 0.00005
-learning_rate = 0.0001
+learning_rate = 0.00001
 alpha=.5
-batch_size = 64
+batch_size = 32
 desired_size=Constants.desired_size
 writer = ""
 loaded_anchor_boxes = None
@@ -714,7 +719,7 @@ if __name__ == "__main__":
 
             #test_loader = DataLoader(dataset=test_dataset, batch_size=1, shuffle=False, num_workers=3,prefetch_factor=2,persistent_workers=True, pin_memory=True)
             train_loader = DataLoader(dataset=train_dataset, batch_size=batch_size, shuffle=True, num_workers=2,prefetch_factor=2,persistent_workers=True, pin_memory=True)
-            train_loader_verified = DataLoader(dataset=test_dataset, batch_size=batch_size, shuffle=False, num_workers=2,prefetch_factor=2,persistent_workers=True, pin_memory=True)
+            train_loader_verified = DataLoader(dataset=test_dataset, batch_size=64, shuffle=False, num_workers=2,prefetch_factor=2,persistent_workers=True, pin_memory=True)
 
             # Compute max_boxes from both training and test datasets
             #max_boxes_train = compute_max_boxes(train_loader)

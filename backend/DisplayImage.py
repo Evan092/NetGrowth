@@ -71,7 +71,7 @@ def draw_bounding_boxes(image_path, truth_boxes, pred_boxes, epoch1, i1, transfo
     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
     # Draw truth boxes
-    for (x1, y1, x2, y2) in truth_boxes.squeeze(1):
+    for (x1, y1, x2, y2) in truth_boxes.squeeze(0):
         start_point = (int(x1), int(y1))
         end_point = (int(x2), int(y2))
         image = cv2.rectangle(image, start_point, end_point, truth_color, thickness)

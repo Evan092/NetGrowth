@@ -230,6 +230,9 @@ def filter_and_trim_boxes(pred_boxes, target_boxes, max_boxes=Constants.max_boxe
             matched_pred_indices = torch.from_numpy(row_ind).to(dious.device)
             matched_gt_indices = torch.from_numpy(col_ind).to(dious.device)
 
+            #matched_pred_indices, matched_gt_indices = apply_greedy_matching(dious)
+
+
             # Now, 'matched_pred_indices' and 'matched_gt_indices' are your matched indices without repeats
             matched_indices = (matched_pred_indices, matched_gt_indices)
 
@@ -538,6 +541,30 @@ def postprocess_yolo_output2(output, loaded_anchor_boxes, stride=(Constants.desi
     output[..., 4] = torch.sigmoid(output[..., 4])
 
     return output
+
+def apply_greedy_matching(dious, threshold=0.5):
+    """
+    Greedy matching based on DIoU values.
+    This function replaces the Hungarian matching with a simple greedy approach.
+    
+    Args:
+        dious (Tensor): DIoU values of shape [N, num_valid].
+        threshold (float): Threshold for matching.
+
+    Returns:
+        matched_indices (tuple): Indices of matched predictions and ground truth boxes.
+    """
+    # Find the best matching box for each ground truth box (greedy max)
+    max_dious, pred_indices = torch.max(dious, dim=0)
+
+    # Apply the threshold to filter out low DIoU matches
+    matched_gt_indices = torch.arange(dious.size(1), device=dious.device)[max_dious > threshold]
+
+    # Filter corresponding prediction indices
+    matched_pred_indices = pred_indices[max_dious > threshold]
+
+    return matched_pred_indices, matched_gt_indices
+
 
 
 
@@ -941,6 +968,9 @@ class CombinedLoss(nn.Module):
 
         pred_boxes = postprocess_yolo_output(pred_boxes, self.anchor_boxes)
 
+        unfiltered_pred_boxes = pred_boxes[..., :4]  # [batch_size, N, 4]
+        unfiltered_confidences = pred_boxes[..., 4]
+
 
         #Trim the padding bboxes, and remove the least confident bboxes for the corresponding batch Item
         target_boxes, pred_boxes, confidences_flat = filter_and_trim_boxes(pred_boxes, target_boxes)
@@ -956,6 +986,7 @@ class CombinedLoss(nn.Module):
         #pred_boxes[:, 3] = torch.clamp(pred_boxes[:, 3], min=1)  # Clamp height
 
         pred_boxes = yolo_to_corners(pred_boxes, self.anchor_boxes)
+        unfiltered_pred_boxes = yolo_to_corners(unfiltered_pred_boxes.view(-1,4), self.anchor_boxes)
 
 
         # Extract x1, y1, x2, y2 from pred_boxes
@@ -1023,17 +1054,20 @@ class CombinedLoss(nn.Module):
         #get loss for distance from coordinates. Divide by desired_size to scale 0-1
         smooth_l1_loss_value = (self.smooth_l1_loss(pred_boxes, target_boxes)/Constants.desired_size)
 
-        target_conf = calculate_target_conf(pred_boxes, target_boxes)
-        bce_loss_value = self.bce_loss(confidences_scaled.squeeze(1), target_conf)
+
         #Formula for overlaps + distance
         diou_loss_value = self.diou_loss(pred_boxes,target_boxes)
+
+        
+        target_conf = calculate_target_conf(unfiltered_pred_boxes.view(-1,4), target_boxes)
+        bce_loss_value = self.bce_loss(unfiltered_confidences.view(-1), target_conf)
 
         
         #smooth_l1_loss_value = smooth_l1_loss_value
         iou_loss_value = iou_loss_value * mask.float()
         diou_loss_value = diou_loss_value * mask.float()
         confidences_scaled = confidences_scaled.squeeze(-1) * mask.float()
-        bce_loss_value = bce_loss_value * mask.float()
+        bce_loss_value = bce_loss_value #* mask.float()
 
         #scale
         iou_loss_value_scaled = iou_loss_value * self.IoUScale
@@ -1046,14 +1080,21 @@ class CombinedLoss(nn.Module):
         iou_loss_value_average = iou_loss_value_scaled.sum()/mask.float().sum()
         diou_loss_value_average = diou_loss_value_scaled.sum()/mask.float().sum()
         smooth_l1_loss_average = smooth_l1_loss_scaled.sum()/mask.float().sum()
-        bce_loss_average = bce_loss_scaled.sum()/mask.float().sum()
+        bce_loss_average = bce_loss_scaled.mean() #/mask.float().sum()
 
 
-        x = (iou_loss_value_scaled + diou_loss_value_scaled + smooth_l1_loss_scaled + bce_loss_scaled).sum()/mask.float().sum()
+        x = ((iou_loss_value_scaled + diou_loss_value_scaled + smooth_l1_loss_scaled).sum()/mask.float().sum()) + bce_loss_scaled.mean()
         y= confidences_scaled.sum()/mask.float().sum()
 
 
+        total_loss = (
+            iou_loss_value_average +
+            diou_loss_value_average +
+            smooth_l1_loss_average +
+            bce_loss_average
+        ) / (self.IoUScale + self.DIoUScale + self.SmoothL1LossScale + self.BCEScale)
 
+        
         # Loss formula
         #Distance from perfect and confident (Lower the more perfect we are)
         good_loss = torch.sqrt((0 - x)**2 + (1 - y)**2) * self.GoodMultiplier
@@ -1072,7 +1113,7 @@ class CombinedLoss(nn.Module):
         print(iou_loss_value_average.item(), diou_loss_value_average.item(), smooth_l1_loss_average.item(), bce_loss_average.item(), end=" ")
         #Scale total losses with confidence
 
-        negative_penalty_loss = (negative_width_penalty + negative_height_penalty).mean() * self.negativePenaltyWeight
+        negative_penalty_loss = 0 #(negative_width_penalty + negative_height_penalty).mean() * self.negativePenaltyWeight
 
         if step != -1:
             writer.add_scalar('avg Confidence', confidences_flat.mean(), step)
@@ -1098,7 +1139,7 @@ class CombinedLoss(nn.Module):
         #penaltyPercent = f"{penalty/(diou_loss_value_scaled + iou_loss_value_scaled + penalty_scaled) * 100:.2f}%"
         # Combined loss: weighted sum of both IoU and SmoothL1
 
-        return x
+        return total_loss
     
 
     def yolo_loss(self, pred_boxes, pred_conf, pred_classes, target_boxes, target_classes, target_mask):
