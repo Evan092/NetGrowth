@@ -1,4 +1,5 @@
 import math
+import scipy
 import torch
 import torch.nn as nn
 import torchvision
@@ -7,6 +8,8 @@ import Constants
 from GIoULoss import GIoULoss
 import torch
 import torch.nn.functional as F
+import numpy as np
+from scipy.optimize import linear_sum_assignment
 
 
 
@@ -36,6 +39,53 @@ def filter_confidences(pred_boxes, confidences, threshold=0.5):
         filtered_confidences = filtered_confidences.unsqueeze(0)
 
     return filtered_boxes, filtered_confidences
+
+def calculate_iou(box1, box2):
+    """Compute IoU between two sets of boxes."""
+    # Get coordinates
+    x1 = torch.max(box1[:, 0].unsqueeze(1), box2[:, 0])
+    y1 = torch.max(box1[:, 1].unsqueeze(1), box2[:, 1])
+    x2 = torch.min(box1[:, 2].unsqueeze(1), box2[:, 2])
+    y2 = torch.min(box1[:, 3].unsqueeze(1), box2[:, 3])
+    
+    # Compute intersection area
+    inter_area = (x2 - x1).clamp(min=0) * (y2 - y1).clamp(min=0)
+    
+    # Compute areas of individual boxes
+    box1_area = (box1[:, 2] - box1[:, 0]) * (box1[:, 3] - box1[:, 1])
+    box2_area = (box2[:, 2] - box2[:, 0]) * (box2[:, 3] - box2[:, 1])
+    
+    # Compute union area
+    union_area = box1_area.unsqueeze(1) + box2_area - inter_area
+    
+    # Avoid division by zero by adding a small epsilon value
+    iou = inter_area / (union_area + 1e-6)
+    
+    return iou
+
+def calculate_target_conf(pred_boxes, gt_boxes, iou_threshold=0.5):
+    """
+    Calculate target_conf for each predicted box.
+    
+    Args:
+        pred_boxes (Tensor): Tensor of shape (N, 4) where N is the number of predicted boxes.
+        gt_boxes (Tensor): Tensor of shape (M, 4) where M is the number of ground truth boxes.
+        iou_threshold (float): IoU threshold for positive detection.
+
+    Returns:
+        target_conf (Tensor): Tensor of shape (N,) with values 0 or 1.
+    """
+    # Calculate IoUs between all predicted boxes and ground truth boxes
+    ious = calculate_iou(pred_boxes, gt_boxes)
+
+    # Determine maximum IoU for each predicted box
+    max_ious, _ = ious.max(dim=1)
+
+    # Assign confidence based on IoU threshold
+    target_conf = (max_ious >= iou_threshold).float()
+
+    return target_conf
+
 
 def apply_nms(pred_boxes, confidences, iou_threshold=0.5):
     """
@@ -166,9 +216,22 @@ def filter_and_trim_boxes(pred_boxes, target_boxes, max_boxes=Constants.max_boxe
         matched_indices = (dious > iou_threshold).nonzero(as_tuple=True)
 
         # If no matches exceed the threshold, fallback to the best DIoU
-        if matched_indices[0].numel() == 0:
-            best_matches = torch.argmax(dious, dim=0)
-            matched_indices = (best_matches, torch.arange(valid_boxes.shape[0]))
+        if matched_indices[0].numel() == 0 or True:
+            # Convert 'dious' to a NumPy array
+            dious_np = dious.detach().cpu().numpy()
+
+            # Compute the cost matrix
+            cost_matrix = 1 - dious_np  # Use '1 - dious_np' if DIoU values are between 0 and 1
+
+            # Apply the Hungarian algorithm
+            row_ind, col_ind = linear_sum_assignment(cost_matrix)
+
+            # Convert the indices back to tensors if needed
+            matched_pred_indices = torch.from_numpy(row_ind).to(dious.device)
+            matched_gt_indices = torch.from_numpy(col_ind).to(dious.device)
+
+            # Now, 'matched_pred_indices' and 'matched_gt_indices' are your matched indices without repeats
+            matched_indices = (matched_pred_indices, matched_gt_indices)
 
         # Collect assigned predicted boxes and their confidences
         assigned_mask = torch.zeros(pred_coords.shape[1], dtype=torch.bool, device=pred_coords.device)
@@ -825,6 +888,7 @@ class CombinedLoss(nn.Module):
         self.iou_loss = IoULoss()
         self.smooth_l1_loss = nn.SmoothL1Loss(reduction='none')
         self.diou_loss = DIoULoss()
+        self.bce_loss = nn.BCEWithLogitsLoss(reduction='none')
         self.confidencePenalty = ConfidencePenalty()
         self.anchor_boxes = anchor_boxes
 
@@ -834,10 +898,10 @@ class CombinedLoss(nn.Module):
         
 
 
-        self.IoUScale = 1 # Weight of IoU loss
+        self.IoUScale = 0 # Weight of IoU loss
         self.DIoUScale = 0.2 #Weight of DIoU loss
         self.SmoothL1LossScale = 2 #Weight of SmoothL1Loss
-
+        self.BCEScale = 0.075
 
         self.confidenceScale = 1.0 #Weight of our Confidence levels
         self.incorrectAreaScale = 0.1
@@ -847,8 +911,8 @@ class CombinedLoss(nn.Module):
 
         self.negativePenaltyWeight = 0.2
 
-        self.GoodMultiplier = 3
-        self.BadMultiplier = 2.25
+        self.GoodMultiplier = 1
+        self.BadMultiplier = 0
 
         self.outOfBoundsPenaltyScale = 0.0075
 
@@ -937,7 +1001,6 @@ class CombinedLoss(nn.Module):
             #writer.add_scalar('Scaled Penalty', penalty_scaled, step)
 
         #Min the confidence levels and scale.
-        confidences_scaled = confidences_flat * self.confidenceScale
 
         #Measure overlaps. 0 is perfect, 1 is none
         #Add a penalty for non-perfect overlap
@@ -949,34 +1012,44 @@ class CombinedLoss(nn.Module):
             padding = torch.zeros(pad_size, 4, device=pred_boxes.device)
             confPadding =  torch.zeros(pad_size, 1, device=pred_boxes.device)
             pred_boxes = torch.cat([pred_boxes, padding], dim=0)
-            confidences_scaled = torch.cat([confidences_scaled, confPadding], dim=0)
+            confidences_flat = torch.cat([confidences_flat, confPadding], dim=0)
             mask[-pad_size:] = False  # Update mask to indicate padded areas
 
-        try:
-            iou_loss_value = 0 #self.iou_loss(pred_boxes, target_boxes)
 
-            #get loss for distance from coordinates. Divide by desired_size to scale 0-1
-            smooth_l1_loss_value = (self.smooth_l1_loss(pred_boxes, target_boxes)/Constants.desired_size)
+        confidences_scaled = confidences_flat * self.confidenceScale
+        #try:
+        iou_loss_value = 0 #self.iou_loss(pred_boxes, target_boxes)
 
-            #Formula for overlaps + distance
-            diou_loss_value = self.diou_loss(pred_boxes,target_boxes)
-        except Exception as e:
-            # Code that runs for any other exception
-            print(f"An error occurred: {e}")
+        #get loss for distance from coordinates. Divide by desired_size to scale 0-1
+        smooth_l1_loss_value = (self.smooth_l1_loss(pred_boxes, target_boxes)/Constants.desired_size)
+
+        target_conf = calculate_target_conf(pred_boxes, target_boxes)
+        bce_loss_value = self.bce_loss(confidences_scaled.squeeze(1), target_conf)
+        #Formula for overlaps + distance
+        diou_loss_value = self.diou_loss(pred_boxes,target_boxes)
 
         
         #smooth_l1_loss_value = smooth_l1_loss_value
         iou_loss_value = iou_loss_value * mask.float()
         diou_loss_value = diou_loss_value * mask.float()
         confidences_scaled = confidences_scaled.squeeze(-1) * mask.float()
+        bce_loss_value = bce_loss_value * mask.float()
 
         #scale
         iou_loss_value_scaled = iou_loss_value * self.IoUScale
         diou_loss_value_scaled = diou_loss_value * self.DIoUScale
         smooth_l1_loss_scaled = (smooth_l1_loss_value * self.SmoothL1LossScale).mean(dim=1, keepdim=True).squeeze(-1) * mask
+        bce_loss_scaled = bce_loss_value * self.BCEScale
 
-        maxLoss = self.IoUScale + self.DIoUScale + self.SmoothL1LossScale
-        x = (iou_loss_value_scaled + diou_loss_value_scaled + smooth_l1_loss_scaled).sum()/mask.float().sum()
+        maxLoss = self.IoUScale + self.DIoUScale + self.SmoothL1LossScale + self.BCEScale
+
+        iou_loss_value_average = iou_loss_value_scaled.sum()/mask.float().sum()
+        diou_loss_value_average = diou_loss_value_scaled.sum()/mask.float().sum()
+        smooth_l1_loss_average = smooth_l1_loss_scaled.sum()/mask.float().sum()
+        bce_loss_average = bce_loss_scaled.sum()/mask.float().sum()
+
+
+        x = (iou_loss_value_scaled + diou_loss_value_scaled + smooth_l1_loss_scaled + bce_loss_scaled).sum()/mask.float().sum()
         y= confidences_scaled.sum()/mask.float().sum()
 
 
@@ -996,7 +1069,7 @@ class CombinedLoss(nn.Module):
         #losses = loss (self.IoUScale + self.DIoUScale + self.SmoothL1LossScale) - ((diou_loss_value_scaled + iou_loss_value_scaled + smooth_l1_loss_scaled) * confidences_scaled).mean()
 
         print("Losses: ", end="")
-        print(good_loss.item(), bad_loss.item(), losses.item(), end=" ")
+        print(iou_loss_value_average.item(), diou_loss_value_average.item(), smooth_l1_loss_average.item(), bce_loss_average.item(), end=" ")
         #Scale total losses with confidence
 
         negative_penalty_loss = (negative_width_penalty + negative_height_penalty).mean() * self.negativePenaltyWeight
@@ -1025,7 +1098,7 @@ class CombinedLoss(nn.Module):
         #penaltyPercent = f"{penalty/(diou_loss_value_scaled + iou_loss_value_scaled + penalty_scaled) * 100:.2f}%"
         # Combined loss: weighted sum of both IoU and SmoothL1
 
-        return final_loss
+        return x
     
 
     def yolo_loss(self, pred_boxes, pred_conf, pred_classes, target_boxes, target_classes, target_mask):

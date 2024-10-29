@@ -666,7 +666,7 @@ def compute_max_boxes(dataloader):
 
 weight_decay = 1e-5
 learning_rate = 0.00005
-learning_rate = 0.0005
+learning_rate = 0.0001
 alpha=.5
 batch_size = 64
 desired_size=Constants.desired_size
