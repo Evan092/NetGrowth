@@ -928,7 +928,7 @@ class CombinedLoss(nn.Module):
         self.IoUScale = 0 # Weight of IoU loss
         self.DIoUScale = 0.2 #Weight of DIoU loss
         self.SmoothL1LossScale = 2 #Weight of SmoothL1Loss
-        self.BCEScale = 0.075
+        self.BCEScale = 0.04
 
         self.confidenceScale = 1.0 #Weight of our Confidence levels
         self.incorrectAreaScale = 0.1
@@ -1118,12 +1118,13 @@ class CombinedLoss(nn.Module):
         if step != -1:
             writer.add_scalar('avg Confidence', confidences_flat.mean(), step)
             writer.add_scalar('avg Coordinate', pred_boxes.mean(), step)
-            writer.add_scalar('Negative Penalty', negative_penalty_loss, step)
-            writer.add_scalar('Too Big Penalty', outOfBoundsPenalty, step)
+            writer.add_scalar('BCE Loss', bce_loss_average.item(), step)
+            #writer.add_scalar('Negative Penalty', negative_penalty_loss, step)
+            #writer.add_scalar('Too Big Penalty', outOfBoundsPenalty, step)
             #writer.add_scalar('iou_loss_value', iou_loss_value_scaled.mean(), step)
             writer.add_scalar('diou_loss_value', diou_loss_value_scaled.mean(), step)
             writer.add_scalar('smooth_l1_loss_value', smooth_l1_loss_scaled.mean(), step)
-            writer.add_scalar('Loss/train', losses.item(), step)
+            writer.add_scalar('Loss/train', total_loss.item(), step)
 
 
         # Add the negative width and height penalties to the total loss

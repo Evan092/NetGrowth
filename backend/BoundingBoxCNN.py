@@ -671,7 +671,7 @@ def compute_max_boxes(dataloader):
 
 weight_decay = 1e-5
 learning_rate = 0.00005
-learning_rate = 0.00001
+learning_rate =2.5e-6
 alpha=.5
 batch_size = 32
 desired_size=Constants.desired_size
@@ -783,7 +783,7 @@ if __name__ == "__main__":
             #warmup_scheduler = LinearLR(optimizer, start_factor=0.01, total_iters=10)
 
             # ReduceLROnPlateau for long-term control
-            plateau_scheduler = ReduceLROnPlateau(optimizer, mode='min', patience=10, factor=0.5, threshold=0.01)
+            plateau_scheduler = ReduceLROnPlateau(optimizer, mode='min', patience=10, factor=0.9, threshold=0.01)
 
             # Combine both schedulers
             #scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, plateau_scheduler], milestones=[10])
