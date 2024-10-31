@@ -690,7 +690,7 @@ weight_decay = 1e-4
 learning_rate = 0.00005
 learning_rate =1e-5
 alpha=.5
-batch_size = 32
+batch_size = 16
 desired_size=Constants.desired_size
 writer = ""
 loaded_anchor_boxes = None
@@ -800,7 +800,7 @@ if __name__ == "__main__":
             #warmup_scheduler = LinearLR(optimizer, start_factor=0.01, total_iters=10)
 
             # ReduceLROnPlateau for long-term control
-            lr_sequence = [1e-6, 1e-5, 1e-4, 1e-3]
+            lr_sequence = [5e-5, 1e-4, 5e-4, 1e-3]
             warmup_steps = len(lr_sequence)
             warmup_scheduler = WarmupScheduler(optimizer, warmup_steps, lr_sequence)
 

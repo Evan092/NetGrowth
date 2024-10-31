@@ -190,6 +190,107 @@ def diou_batch(pred_boxes, target_boxes):
     return iou - (center_dist / (enclose_dist + 1e-6))  # DIoU formula
 
 
+import torch
+
+def filter_and_trim_boxes2(pred_boxes, target_boxes, max_boxes=None, iou_threshold=0.5):
+    batch_size, num_anchors, grid_h, grid_w, num_outputs = pred_boxes.shape
+
+    # Reshape predictions to [batch_size, N, 5]
+    pred_boxes = pred_boxes.view(batch_size, -1, 5)  # N = num_anchors * grid_h * grid_w
+    pred_coords = pred_boxes[..., :4]  # [batch_size, N, 4]
+    pred_confidences = pred_boxes[..., 4:5]  # [batch_size, N, 1]
+
+    valid_mask = (target_boxes.sum(dim=-1) > 0)  # [batch_size, num_boxes]
+
+    filtered_target_boxes = []
+    filtered_pred_boxes = []
+    filtered_confidences = []
+
+    for i in range(batch_size):
+        valid_boxes = target_boxes[i][valid_mask[i]]  # [num_valid_boxes, 4]
+        if valid_boxes.numel() == 0:
+            continue  # Skip if no valid boxes
+
+        pred_coords_i = pred_coords[i]  # [N, 4]
+        pred_confidences_i = pred_confidences[i]  # [N, 1]
+
+        # Compute DIoU between all predicted and valid ground-truth boxes
+        dious = diou(pred_coords_i, valid_boxes)  # [N_pred, N_gt]
+
+        # Convert DIoU to cost matrix
+        cost_matrix = 1 - dious  # Lower cost is better
+
+        # Apply Hungarian algorithm on GPU
+        matched_pred_indices, matched_gt_indices = hungarian(cost_matrix)
+
+        # Filter matches based on IoU threshold
+        #valid_matches = dious[matched_pred_indices, matched_gt_indices].bool() # iou_threshold
+        #matched_pred_indices = matched_pred_indices[valid_matches]
+        #matched_gt_indices = matched_gt_indices[valid_matches]
+
+        # Collect assigned predicted boxes and their confidences
+        filtered_pred_coords = pred_coords_i[matched_pred_indices]
+        filtered_confidences_flat = pred_confidences_i[matched_pred_indices]
+
+        filtered_target_boxes.append(valid_boxes[matched_gt_indices])
+        filtered_pred_boxes.append(filtered_pred_coords)
+        filtered_confidences.append(filtered_confidences_flat)
+
+    # Concatenate results across the batch
+    if filtered_target_boxes:
+        target_boxes_flat = torch.cat(filtered_target_boxes, dim=0)
+        pred_boxes_flat = torch.cat(filtered_pred_boxes, dim=0)
+        confidences_flat = torch.cat(filtered_confidences, dim=0)
+    else:
+        target_boxes_flat = torch.empty(0, 4, device=pred_boxes.device)
+        pred_boxes_flat = torch.empty(0, 4, device=pred_boxes.device)
+        confidences_flat = torch.empty(0, 1, device=pred_boxes.device)
+
+    return target_boxes_flat, pred_boxes_flat, confidences_flat
+
+def hungarian(cost_matrix):
+    """
+    Implements the Hungarian algorithm using PyTorch tensors.
+    Args:
+        cost_matrix (torch.Tensor): [num_preds, num_gts]
+    Returns:
+        matched_pred_indices (torch.Tensor): Indices of matched predictions
+        matched_gt_indices (torch.Tensor): Indices of matched ground truths
+    """
+    num_preds, num_gts = cost_matrix.shape
+    cost_matrix = cost_matrix.clone()
+
+    # Initialize
+    u = torch.zeros(num_preds, device=cost_matrix.device)
+    v = torch.zeros(num_gts, device=cost_matrix.device)
+    ind_pred = torch.full((num_preds,), -1, dtype=torch.long, device=cost_matrix.device)
+    ind_gt = torch.full((num_gts,), -1, dtype=torch.long, device=cost_matrix.device)
+
+    # For simplicity, we use a basic implementation suitable for small matrices.
+    # For larger matrices, consider using optimized libraries or implementations.
+    for _ in range(num_preds):
+        # Find the minimal uncovered element
+        min_value = cost_matrix.min()
+        if min_value == float('inf'):
+            break
+
+        pred_idx, gt_idx = (cost_matrix == min_value).nonzero(as_tuple=True)
+        pred_idx = pred_idx[0]
+        gt_idx = gt_idx[0]
+
+        # Assign and cover the row and column
+        ind_pred[pred_idx] = gt_idx
+        ind_gt[gt_idx] = pred_idx
+        cost_matrix[pred_idx, :] = float('inf')
+        cost_matrix[:, gt_idx] = float('inf')
+
+    # Filter out unassigned predictions and ground truths
+    matched_pred_indices = (ind_pred != -1).nonzero(as_tuple=True)[0]
+    matched_gt_indices = ind_pred[matched_pred_indices]
+
+    return matched_pred_indices, matched_gt_indices
+
+
 def filter_and_trim_boxes(pred_boxes, target_boxes, max_boxes=Constants.max_boxes, iou_threshold=0.5):
     batch_size, num_anchors, grid_h, grid_w, num_outputs = pred_boxes.shape
 
@@ -217,6 +318,7 @@ def filter_and_trim_boxes(pred_boxes, target_boxes, max_boxes=Constants.max_boxe
 
         # If no matches exceed the threshold, fallback to the best DIoU
         if matched_indices[0].numel() == 0 or True:
+            
             # Convert 'dious' to a NumPy array
             dious_np = dious.detach().cpu().numpy()
 
