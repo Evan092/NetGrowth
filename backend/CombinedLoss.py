@@ -928,7 +928,7 @@ class CombinedLoss(nn.Module):
         self.IoUScale = 0 # Weight of IoU loss
         self.DIoUScale = 0.2 #Weight of DIoU loss
         self.SmoothL1LossScale = 2 #Weight of SmoothL1Loss
-        self.BCEScale = 0.04
+        self.BCEScale = 0.01
 
         self.confidenceScale = 1.0 #Weight of our Confidence levels
         self.incorrectAreaScale = 0.1

@@ -631,7 +631,24 @@ def calculate_valid_iou(pred_boxes, true_boxes):
 
     return diag_iou.mean().item()  # Return the average IoU
 
+class WarmupScheduler:
+    def __init__(self, optimizer, warmup_steps, lr_sequence):
+        self.optimizer = optimizer
+        self.warmup_steps = warmup_steps
+        self.lr_sequence = lr_sequence
+        self.step_num = 0
 
+    def step(self):
+        if self.step_num < self.warmup_steps:
+            lr = self.lr_sequence[self.step_num]
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = lr
+            print(f"Warmup Epoch {self.step_num + 1}: Learning rate set to {lr}")
+            self.step_num += 1
+        else:
+            # Return False to indicate warmup is complete
+            return False
+        return True
 
 
 class SquarePad:
@@ -669,9 +686,9 @@ def compute_max_boxes(dataloader):
                 max_boxes = num_boxes
     return max_boxes
 
-weight_decay = 1e-5
+weight_decay = 1e-4
 learning_rate = 0.00005
-learning_rate =2.5e-6
+learning_rate =1e-5
 alpha=.5
 batch_size = 32
 desired_size=Constants.desired_size
@@ -783,6 +800,11 @@ if __name__ == "__main__":
             #warmup_scheduler = LinearLR(optimizer, start_factor=0.01, total_iters=10)
 
             # ReduceLROnPlateau for long-term control
+            lr_sequence = [1e-6, 1e-5, 1e-4, 1e-3]
+            warmup_steps = len(lr_sequence)
+            warmup_scheduler = WarmupScheduler(optimizer, warmup_steps, lr_sequence)
+
+            # Initialize ReduceLROnPlateau scheduler
             plateau_scheduler = ReduceLROnPlateau(optimizer, mode='min', patience=10, factor=0.9, threshold=0.01)
 
             # Combine both schedulers
@@ -809,6 +831,7 @@ if __name__ == "__main__":
             #print(f'Test Loss: {test_loss:.4f}, Test Acc: {test_acc:.2f}%')
 
             while epoch < num_epochs:
+                in_warmup = warmup_scheduler.step() if epoch < warmup_steps - 1 else False
                 #torch.nn.utils.clip_grad_norm_(cnn_model.parameters(), max_norm=max_norm)
                 print(f'==========Epoch [{epoch+1}/{num_epochs}] =========')
                 print(f'Training Progress ({datetime.now().strftime("%Y-%m-%d %H:%M:%S")}):')
@@ -822,7 +845,9 @@ if __name__ == "__main__":
                 print(f'Current Learning Rate: {optimizer.param_groups[0]["lr"]:.6f}', end=" & ")
 
                 # Update learning rate based on test loss
-                plateau_scheduler.step(test_loss)
+                
+                if not in_warmup:
+                    plateau_scheduler.step(train_loss)
 
                 # Print the updated learning rate
                 print(f'New Learning Rate: {optimizer.param_groups[0]["lr"]:.6f}')
