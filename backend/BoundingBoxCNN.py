@@ -23,6 +23,10 @@ from torch.optim.lr_scheduler import SequentialLR, LinearLR, ReduceLROnPlateau
 from torch.utils.tensorboard import SummaryWriter
 import torch.multiprocessing as mp
 import gc
+from torch_lr_finder import LRFinder
+import torch
+import matplotlib.pyplot as plt
+
 #from yolov5 import detect
 
 
@@ -427,7 +431,7 @@ def train(model, loader, criterion, optimizer, optionalLoader=None):
     progress = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100]
 
     if optionalLoader and False:
-        image, bbox, path = get_nth_image(optionalLoader, 1)
+        image, bbox, path = get_nth_image(optionalLoader, 1 ,-1)
         image = image.to(device)
         image = image.unsqueeze(0)
         bbox = bbox.to(device)
@@ -441,11 +445,11 @@ def train(model, loader, criterion, optimizer, optionalLoader=None):
         DisplayImage.draw_bounding_boxes(path, bbox, output, transform)
 
     #for images, bboxes in loader:
-    for batch_idx, (images, bboxes, _) in enumerate(loader):
+    for batch_idx, (images, bboxes, path) in enumerate(loader):
         # Forward pass: compute model outputs (bounding box coordinates)
         i+=1
 
-        if (batch_idx == 1 or batch_idx % 30 == 0) and True:
+        if (batch_idx == 1 or batch_idx % 30 == 0) and False:
             image, bbox, path = get_nth_image(optionalLoader, 1)
             image = image.to(device)
             image = image.unsqueeze(0)
@@ -461,13 +465,16 @@ def train(model, loader, criterion, optimizer, optionalLoader=None):
             pred_confidences = pred_confidences.view(-1, 1)
             bbox = fix_box_coordinates(bbox)
             _, bbox = clipBoxes(pred_coords,bbox)
-            pred_coords =  yolo_to_corners(pred_coords.squeeze(0), loaded_anchor_boxes)
+            pred_coords =  yolo_to_corners(pred_coords.squeeze(0))
             pred_coords, pred_confidences = filter_confidences(pred_coords, pred_confidences)
             pred_coords, pred_confidences = apply_nms(pred_coords, pred_confidences)
             DisplayImage.draw_bounding_boxes(path, bbox, pred_coords, epoch+1, batch_idx, transform)
             print("Image taken",epoch+1, batch_idx, pred_coords.shape[0])
 
-
+        if torch.isnan(images).any() or torch.isinf(images).any():
+            print(f"NaN or Inf detected in images at batch {batch_idx}")
+        if torch.isnan(bboxes).any() or torch.isinf(bboxes).any():
+            print(f"NaN or Inf detected in bounding boxes at batch {batch_idx}")
         percentage = (i / len(loader)) * 100
         # This checks if the current percentage point is approximately a multiple of 5
         if len(progress) > 0 and int(percentage) >= progress[0]:  # Ensuring that it checks every 5% increment
@@ -475,13 +482,13 @@ def train(model, loader, criterion, optimizer, optionalLoader=None):
         images = images.to(device)
         bboxes = bboxes.to(device)
         outputs = model(images)
-        outputs[1] = outputs[1][..., :5]
+        #outputs[1] = outputs[1][..., :5]
 
         #writer.add_scalar('Avg output', outputs[1].mean(), epoch * len(train_loader) + batch_idx)
         if False:
             print("")
         # Compute the loss between predicted and true bounding box coordinates
-        loss = criterion(outputs[1], bboxes, writer, epoch * len(train_loader) + batch_idx)
+        loss = criterion(outputs, bboxes, writer, epoch * len(train_loader) + batch_idx)
 
         # Log training loss for this batch to TensorBoard
         current_lr = optimizer.param_groups[0]['lr']
@@ -688,7 +695,7 @@ def compute_max_boxes(dataloader):
 
 weight_decay = 1e-4
 learning_rate = 0.00005
-learning_rate =1e-5
+learning_rate =8.02e-4
 alpha=.5
 batch_size = 16
 desired_size=Constants.desired_size
@@ -735,8 +742,8 @@ if __name__ == "__main__":
             test_dataset.setMaxDimensions(desired_size, desired_size)
 
             #test_loader = DataLoader(dataset=test_dataset, batch_size=1, shuffle=False, num_workers=3,prefetch_factor=2,persistent_workers=True, pin_memory=True)
-            train_loader = DataLoader(dataset=train_dataset, batch_size=batch_size, shuffle=True, num_workers=2,prefetch_factor=2,persistent_workers=True, pin_memory=True)
-            train_loader_verified = DataLoader(dataset=test_dataset, batch_size=64, shuffle=False, num_workers=2,prefetch_factor=2,persistent_workers=True, pin_memory=True)
+            train_loader = DataLoader(dataset=train_dataset, batch_size=batch_size, shuffle=True, num_workers=2,prefetch_factor=2,persistent_workers=True,  pin_memory=False)
+            train_loader_verified = DataLoader(dataset=test_dataset, batch_size=64, shuffle=False, num_workers=2,prefetch_factor=2,persistent_workers=True, pin_memory=False)
 
             # Compute max_boxes from both training and test datasets
             #max_boxes_train = compute_max_boxes(train_loader)
@@ -798,14 +805,54 @@ if __name__ == "__main__":
             optimizer = optim.Adam(cnn_model.parameters(), lr=learning_rate, weight_decay=weight_decay) #, weight_decay=5e-4
             # Warm-up scheduler for the first 10 epochs
             #warmup_scheduler = LinearLR(optimizer, start_factor=0.01, total_iters=10)
+            # Assuming `optimizer` is your optimizer and `device` is your CUDA device (e.g., 'cuda:0')
+
+
+            if False:
+                checkpoint = torch.load("model_checkpoint5.pth", map_location=device)
+                cnn_model.load_state_dict(checkpoint['model_state_dict'])
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                epoch = checkpoint['epoch']
+                loss = checkpoint['loss']
+                for param_group in optimizer.param_groups:
+                    for param in param_group['params']:
+                        state = optimizer.state[param]
+                        for key, value in state.items():
+                            if isinstance(value, torch.Tensor):  # Only move tensors
+                                optimizer.state[param][key] = value.to(device)
+
+            if False:
+                # Initialize the learning rate finder with model, optimizer, and loss function
+                lr_finder = LRFinder(cnn_model, optimizer, criterion, device=device)
+                cnn_model.train()
+
+                lr_finder.range_test(train_loader, start_lr=6e-6, end_lr=1e-5, num_iter=600)
+                lr_finder.plot()
+
+                plt.savefig('lr_finder_plot.png')  # Saves the plot to a file
+                plt.show()  # Display the plot (optional)
+
+                # Convert the loss list to a PyTorch Tensor
+                losses_tensor = torch.tensor(lr_finder.history["loss"])
+
+                # Find the index of the minimum loss
+                min_loss_idx = torch.argmin(losses_tensor)
+
+                # Retrieve the corresponding learning rate
+                optimal_lr = lr_finder.history["lr"][min_loss_idx.item()]  # Use .item() to get Python scalar
+                print(f"Optimal Learning Rate: {optimal_lr}")
+
 
             # ReduceLROnPlateau for long-term control
-            lr_sequence = [5e-5, 1e-4, 5e-4, 1e-3]
+            lr_sequence = [8.02E-04]#, 6.35e-6]#[3.12E-04]#[1.25e-4]#[7.29e-4]#[2e-4, 1.75E-04, 1.81e-4, 7.29E-04]
+
+
+
             warmup_steps = len(lr_sequence)
             warmup_scheduler = WarmupScheduler(optimizer, warmup_steps, lr_sequence)
 
             # Initialize ReduceLROnPlateau scheduler
-            plateau_scheduler = ReduceLROnPlateau(optimizer, mode='min', patience=10, factor=0.9, threshold=0.01)
+            plateau_scheduler = ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.1, threshold=0.01)
 
             # Combine both schedulers
             #scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, plateau_scheduler], milestones=[10])
@@ -829,9 +876,10 @@ if __name__ == "__main__":
 
             #test_loss, test_acc = evaluate(cnn_model, test_loader, criterion)
             #print(f'Test Loss: {test_loss:.4f}, Test Acc: {test_acc:.2f}%')
-
+            torch.autograd.set_detect_anomaly(True)
             while epoch < num_epochs:
-                in_warmup = warmup_scheduler.step() if epoch < warmup_steps - 1 else False
+                in_warmup = warmup_scheduler.step() if epoch < warmup_steps else False
+
                 #torch.nn.utils.clip_grad_norm_(cnn_model.parameters(), max_norm=max_norm)
                 print(f'==========Epoch [{epoch+1}/{num_epochs}] =========')
                 print(f'Training Progress ({datetime.now().strftime("%Y-%m-%d %H:%M:%S")}):')
@@ -856,6 +904,14 @@ if __name__ == "__main__":
                 #alpha = min(alpha + ((1-alpha)/20), 1)
                 #criterion.updateAlpha(alpha)
                 #print(f'New Alpha: {alpha}')
+                # Save after the first epoch
+                torch.save({
+                    'epoch': epoch+1,
+                    'model_state_dict': cnn_model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'loss': train_loss,
+                }, "model_checkpoint"+str(epoch+1)+".pth")
+
 
                 print(f".....................................................{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}")
                 # After the last epoch, ask if the user wants to add more epochs

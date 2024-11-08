@@ -99,7 +99,7 @@ def perform_elbow_method(bounding_boxes):
 # Parameters
 annotations_path = "./backend/training_data/TextOCR_0.1_train.json"
 images_directory = "./backend/training_data/"
-k_clusters = 5  # Adjust as needed
+k_clusters = 9  # Adjust as needed
 
 
 
@@ -110,11 +110,13 @@ data_for_clustering = load_and_prepare_bboxes(annotations_path, images_directory
 #print("Determined Anchor Boxes:", anchor_boxes)
 
 # Assuming 'bounding_boxes' is your array of bounding box dimensions
-kmeans = KMeans(n_clusters=5, random_state=42)
+kmeans = KMeans(n_clusters=9, random_state=42)
 kmeans.fit(data_for_clustering)
 
 # Convert NumPy array of cluster centers to a list
 anchor_boxes = kmeans.cluster_centers_.tolist()
+
+anchor_boxes = sorted(anchor_boxes, key=lambda x: x[0] * x[1])
 
 # Save the anchor boxes to a JSON file
 with open('anchor_boxes.json', 'w') as file:

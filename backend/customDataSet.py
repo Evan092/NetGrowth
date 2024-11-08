@@ -6,13 +6,17 @@ from torch.utils.data import Dataset
 import torchvision.transforms as transforms
 import torchvision.transforms.functional as F
 
+import Constants
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
 class CustomImageDataset(Dataset):
-    maxHeight = 0
-    maxWidth = 0
-    maxBBoxes = 0
-    maxValid = 0
 
     def __init__(self, img_dir, transform=None, train=False):
+        self.maxHeight = Constants.desired_size
+        self.maxWidth = Constants.desired_size
+        self.maxBBoxes = Constants.max_boxes
+        self.maxValid = Constants.max_boxes
         self.img_dir = img_dir
         self.transform = transform
         self.train = train
@@ -177,8 +181,8 @@ class CustomImageDataset(Dataset):
                     #if ann['utf8_string'] != ".":
                     bboxes_with_lengths.append((bbox, len(ann['utf8_string'])))
 
-            if len(bboxes_with_lengths) > self.maxValid:
-                self.maxValid = max(self.maxValid, len(bboxes_with_lengths))
+            #if len(bboxes_with_lengths) > self.maxValid:
+                #self.maxValid = max(self.maxValid, len(bboxes_with_lengths))
 
             # Sort bounding boxes by the length of the utf8_string in descending order
             bboxes_with_lengths.sort(key=lambda x: x[1], reverse=True)
