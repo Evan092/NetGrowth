@@ -12,7 +12,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 class CustomImageDataset(Dataset):
 
-    def __init__(self, img_dir, transform=None, train=False):
+    def __init__(self, img_dir, transform=None, train=False, anchor_boxes=None):
         self.maxHeight = Constants.desired_size
         self.maxWidth = Constants.desired_size
         self.maxBBoxes = Constants.max_boxes
@@ -21,6 +21,7 @@ class CustomImageDataset(Dataset):
         self.transform = transform
         self.train = train
         self.image_filenames = [f for f in os.listdir(img_dir) if os.path.isfile(os.path.join(img_dir, f))]
+        self.anchor_boxes = anchor_boxes
 
         # Set the appropriate JSON file based on training or test data
         if train:
@@ -193,13 +194,54 @@ class CustomImageDataset(Dataset):
             if len(bboxes) == 0:
                 print("None")
 
-            while len(bboxes) < self.maxBBoxes:
-                bboxes.append([0,0,0,0])
+            #while len(bboxes) < self.maxBBoxes:
+                #bboxes.append([0,0,0,0])
 
             # Convert bounding boxes to tensor
             bboxes = torch.as_tensor(bboxes, dtype=torch.float32)
 
+            small_anchors = self.anchor_boxes[:3]    # First 3 anchors for small scale
+            medium_anchors = self.anchor_boxes[3:6]  # Next 3 anchors for medium scale
+            large_anchors = self.anchor_boxes[6:9]   # Last 3 anchors for large scale
+
+            small_scale_boxes = []
+            medium_scale_boxes = []
+            large_scale_boxes = []
+
+            # Function to determine the closest scale based on anchor boxes
+            def get_closest_scale(width, height):
+                box_size = torch.tensor([width, height], dtype=torch.float32)
+
+                # Calculate differences for each scale and find the minimum
+                small_diff = torch.min(torch.norm((small_anchors*Constants.desired_size) - box_size, dim=1))
+                medium_diff = torch.min(torch.norm((medium_anchors*Constants.desired_size) - box_size, dim=1))
+                large_diff = torch.min(torch.norm((large_anchors*Constants.desired_size) - box_size, dim=1))
+
+                # Select the scale with the smallest difference
+                min_diff, scale = torch.min(torch.tensor([small_diff, medium_diff, large_diff]), dim=0)
+                return scale.item()  # 0 for small, 1 for medium, 2 for large
+
+            # Assign each bounding box to the closest scale
+            for box in bboxes:
+                x1, y1, x2, y2 = box
+                width = x2 - x1
+                height = y2 - y1
+
+                # Determine the closest scale
+                scale = get_closest_scale(width, height)
+                if scale == 0:
+                    small_scale_boxes.append(box)
+                elif scale == 1:
+                    medium_scale_boxes.append(box)
+                else:
+                    large_scale_boxes.append(box)
+
+            # Convert lists to tensors
+            small_scale_boxes = torch.stack(small_scale_boxes) if small_scale_boxes else torch.empty((0, 4), dtype=torch.float32)
+            medium_scale_boxes = torch.stack(medium_scale_boxes) if medium_scale_boxes else torch.empty((0, 4), dtype=torch.float32)
+            large_scale_boxes = torch.stack(large_scale_boxes) if large_scale_boxes else torch.empty((0, 4), dtype=torch.float32)
+
             # Return image and bounding boxes as tensors
-            return image, bboxes, img_path
+            return image, [small_scale_boxes, medium_scale_boxes, large_scale_boxes], img_path
         else:
             return image

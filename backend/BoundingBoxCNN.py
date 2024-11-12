@@ -15,6 +15,8 @@ from customDataSet import CustomImageDataset
 import torchvision.ops as ops
 from transforms import ResizeToMaxDimension
 from datetime import datetime
+
+from torch.nn.utils.rnn import pad_sequence
 import torch.profiler
 from CombinedLoss import *
 import Constants
@@ -471,16 +473,17 @@ def train(model, loader, criterion, optimizer, optionalLoader=None):
             DisplayImage.draw_bounding_boxes(path, bbox, pred_coords, epoch+1, batch_idx, transform)
             print("Image taken",epoch+1, batch_idx, pred_coords.shape[0])
 
-        if torch.isnan(images).any() or torch.isinf(images).any():
-            print(f"NaN or Inf detected in images at batch {batch_idx}")
-        if torch.isnan(bboxes).any() or torch.isinf(bboxes).any():
-            print(f"NaN or Inf detected in bounding boxes at batch {batch_idx}")
-        percentage = (i / len(loader)) * 100
+        #if torch.isnan(images).any() or torch.isinf(images).any():
+            #print(f"NaN or Inf detected in images at batch {batch_idx}")
+        #if torch.isnan(bboxes).any() or torch.isinf(bboxes).any():
+            #print(f"NaN or Inf detected in bounding boxes at batch {batch_idx}")
+        percentage = (batch_idx / len(loader)) * 100
         # This checks if the current percentage point is approximately a multiple of 5
         if len(progress) > 0 and int(percentage) >= progress[0]:  # Ensuring that it checks every 5% increment
                 print(f"{progress.pop(0)}% ", end="", flush=True)
         images = images.to(device)
-        bboxes = bboxes.to(device)
+        for i in range(len(bboxes)):
+            bboxes[i] = bboxes[i].to(device)
         outputs = model(images)
         #outputs[1] = outputs[1][..., :5]
 
@@ -693,11 +696,52 @@ def compute_max_boxes(dataloader):
                 max_boxes = num_boxes
     return max_boxes
 
+def custom_collate_fn(batch):
+    images, bboxes, paths = zip(*batch)
+    
+    # Stack images directly (assuming they are all the same size)
+    images = torch.stack(images, dim=0)
+    
+    # Prepare lists to hold padded bounding boxes for each scale
+    small_scale_boxes = []
+    medium_scale_boxes = []
+    large_scale_boxes = []
+    
+    # Find the maximum number of boxes in each scale across the batch
+    max_small_boxes = max(b[0].shape[0] for b in bboxes)
+    max_medium_boxes = max(b[1].shape[0] for b in bboxes)
+    max_large_boxes = max(b[2].shape[0] for b in bboxes)
+    
+    # Pad each scale's bounding boxes and store in the respective list
+    for b in bboxes:
+        # Pad small scale boxes
+        padded_small = torch.cat([b[0], torch.zeros(max_small_boxes - b[0].shape[0], 4)], dim=0) if b[0].shape[0] < max_small_boxes else b[0]
+        small_scale_boxes.append(padded_small)
+        
+        # Pad medium scale boxes
+        padded_medium = torch.cat([b[1], torch.zeros(max_medium_boxes - b[1].shape[0], 4)], dim=0) if b[1].shape[0] < max_medium_boxes else b[1]
+        medium_scale_boxes.append(padded_medium)
+        
+        # Pad large scale boxes
+        padded_large = torch.cat([b[2], torch.zeros(max_large_boxes - b[2].shape[0], 4)], dim=0) if b[2].shape[0] < max_large_boxes else b[2]
+        large_scale_boxes.append(padded_large)
+    
+    # Stack each scale's bounding boxes along the batch dimension
+    small_scale_boxes = torch.stack(small_scale_boxes, dim=0)#.to(device)
+    medium_scale_boxes = torch.stack(medium_scale_boxes, dim=0)#.to(device)
+    large_scale_boxes = torch.stack(large_scale_boxes, dim=0)#.to(device)
+    
+    # Combine scales into a single tensor of shape (batch_size, 3, max_boxes, 4)
+    bboxes = [small_scale_boxes, medium_scale_boxes, large_scale_boxes]
+    
+    return images, bboxes, paths
+
+
 weight_decay = 1e-4
 learning_rate = 0.00005
 learning_rate =8.02e-4
 alpha=.5
-batch_size = 16
+batch_size = 26
 desired_size=Constants.desired_size
 writer = ""
 loaded_anchor_boxes = None
@@ -734,16 +778,24 @@ if __name__ == "__main__":
 
             torch.set_printoptions(sci_mode=False, precision=4)
             
+                        # Load the anchor boxes from a JSON file
+            with open('anchor_boxes.json', 'r') as file:
+                loaded_anchor_boxes = json.load(file)
+                loaded_anchor_boxes = torch.tensor(loaded_anchor_boxes, dtype=torch.float32)
+
             torch.autograd.set_detect_anomaly(True)
-            train_dataset=CustomImageDataset(img_dir='./backend/training_data/', transform=transform, train=True)
-            test_dataset=CustomImageDataset(img_dir='./backend/training_data/', transform=transform, train=False)
+            train_dataset=CustomImageDataset(img_dir='./backend/training_data/', transform=transform, train=True, anchor_boxes=loaded_anchor_boxes)
+            test_dataset=CustomImageDataset(img_dir='./backend/training_data/', transform=transform, train=False, anchor_boxes=loaded_anchor_boxes)
+
+
+            loaded_anchor_boxes = loaded_anchor_boxes.to(device)
 
             train_dataset.setMaxDimensions(desired_size, desired_size)
             test_dataset.setMaxDimensions(desired_size, desired_size)
 
             #test_loader = DataLoader(dataset=test_dataset, batch_size=1, shuffle=False, num_workers=3,prefetch_factor=2,persistent_workers=True, pin_memory=True)
-            train_loader = DataLoader(dataset=train_dataset, batch_size=batch_size, shuffle=True, num_workers=2,prefetch_factor=2,persistent_workers=True,  pin_memory=False)
-            train_loader_verified = DataLoader(dataset=test_dataset, batch_size=64, shuffle=False, num_workers=2,prefetch_factor=2,persistent_workers=True, pin_memory=False)
+            train_loader = DataLoader(dataset=train_dataset, batch_size=batch_size, shuffle=True, num_workers=2,prefetch_factor=2,persistent_workers=True,  pin_memory=False, collate_fn=custom_collate_fn)
+            train_loader_verified = DataLoader(dataset=test_dataset, batch_size=64, shuffle=False, num_workers=2,prefetch_factor=2,persistent_workers=True, pin_memory=False, collate_fn=custom_collate_fn)
 
             # Compute max_boxes from both training and test datasets
             #max_boxes_train = compute_max_boxes(train_loader)
@@ -757,10 +809,6 @@ if __name__ == "__main__":
             #mean, std = get_mean_std_RGB(train_loader)
             #print(f"Mean: {mean}, Std: {std}")
 
-            # Load the anchor boxes from a JSON file
-            with open('anchor_boxes.json', 'r') as file:
-                loaded_anchor_boxes = json.load(file)
-                loaded_anchor_boxes = torch.tensor(loaded_anchor_boxes, dtype=torch.float32).to(device)
 
             #cnn_model = YOLOv3(num_classes=1).to(device)# BoundingBoxCnn(max_boxes, loaded_anchor_boxes).to(device)
             cnn_model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=False).to(device)
@@ -774,7 +822,7 @@ if __name__ == "__main__":
 
             # Ensure it's configured with the correct number of anchors and outputs
             detect_layer.nc = 1  # 1 class (text)
-            detect_layer.na = 5  # 5 anchors
+            detect_layer.na = Constants.num_anchor_boxes  # 5 anchors
             detect_layer.no = 6  # 4 bbox + 1 confidence + 1 class = 6 outputs per anchor
 
             # Apply the custom anchors to the Detect layer
@@ -783,7 +831,7 @@ if __name__ == "__main__":
             # Update the Conv2d layers in the Detect module to output 30 channels
             for i, layer in enumerate(detect_layer.m):
                 in_channels = layer.in_channels
-                detect_layer.m[i] = torch.nn.Conv2d(in_channels, 5 * 6, kernel_size=1)
+                detect_layer.m[i] = torch.nn.Conv2d(in_channels, Constants.num_anchor_boxes * 6, kernel_size=1)
 
 
 
@@ -808,8 +856,8 @@ if __name__ == "__main__":
             # Assuming `optimizer` is your optimizer and `device` is your CUDA device (e.g., 'cuda:0')
 
 
-            if False:
-                checkpoint = torch.load("model_checkpoint5.pth", map_location=device)
+            if True:
+                checkpoint = torch.load("model_checkpoint3.pth", map_location=device)
                 cnn_model.load_state_dict(checkpoint['model_state_dict'])
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 epoch = checkpoint['epoch']
@@ -821,12 +869,12 @@ if __name__ == "__main__":
                             if isinstance(value, torch.Tensor):  # Only move tensors
                                 optimizer.state[param][key] = value.to(device)
 
-            if False:
+            if True:
                 # Initialize the learning rate finder with model, optimizer, and loss function
                 lr_finder = LRFinder(cnn_model, optimizer, criterion, device=device)
                 cnn_model.train()
 
-                lr_finder.range_test(train_loader, start_lr=6e-6, end_lr=1e-5, num_iter=600)
+                lr_finder.range_test(train_loader, end_lr=0.01, num_iter=600)
                 lr_finder.plot()
 
                 plt.savefig('lr_finder_plot.png')  # Saves the plot to a file
@@ -844,15 +892,15 @@ if __name__ == "__main__":
 
 
             # ReduceLROnPlateau for long-term control
-            lr_sequence = [8.02E-04]#, 6.35e-6]#[3.12E-04]#[1.25e-4]#[7.29e-4]#[2e-4, 1.75E-04, 1.81e-4, 7.29E-04]
-
+            lr_sequence = [8.02E-04]#, 4.95e-4]#, 6.35e-6]#[3.12E-04]#[1.25e-4]#[7.29e-4]#[2e-4, 1.75E-04, 1.81e-4, 7.29E-04]
+            # EPOCH 25: 4.95e-4
 
 
             warmup_steps = len(lr_sequence)
             warmup_scheduler = WarmupScheduler(optimizer, warmup_steps, lr_sequence)
 
             # Initialize ReduceLROnPlateau scheduler
-            plateau_scheduler = ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.1, threshold=0.01)
+            plateau_scheduler = ReduceLROnPlateau(optimizer, mode='min', patience=3, factor=0.5, threshold=0.01)
 
             # Combine both schedulers
             #scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, plateau_scheduler], milestones=[10])
