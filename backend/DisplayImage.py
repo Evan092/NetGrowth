@@ -11,7 +11,7 @@ import Constants
 import cv2
 import numpy as np
 
-def resize_and_pad(image, desired_size, color=(0, 0, 0)):
+def resize_and_pad_deprecated(image, desired_size, color=(0, 0, 0)):
     """
     Resize an image to maintain aspect ratio with padding added to make it square.
 
@@ -46,7 +46,7 @@ def resize_and_pad(image, desired_size, color=(0, 0, 0)):
 
 epoch = 0
 i = 0
-def draw_bounding_boxes(image_path, truth_boxes, pred_boxes, epoch1, i1, transform=None, truth_color=(0, 255, 0), pred_color=(255, 0, 0), thickness=2):
+def draw_bounding_boxes(image, truth_boxes, pred_boxes, epoch1, i1, n, transform=None, truth_color=(0, 255, 0), pred_color=(255, 0, 0), thickness=2):
     """
     Draw truth and predicted bounding boxes on an image and display it.
 
@@ -61,27 +61,26 @@ def draw_bounding_boxes(image_path, truth_boxes, pred_boxes, epoch1, i1, transfo
     epoch=epoch1
     i=i1
     # Read the image
-    image = cv2.imread(image_path)
-    if image is None:
-        raise FileNotFoundError(f"The image path {image_path} does not exist.")
     
-    image = resize_and_pad(image, Constants.desired_size)
+    #image = resize_and_pad(image, Constants.desired_size)
 
     # Convert colors from BGR to RGB (for Matplotlib compatibility)
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    image = np.array(image)
 
     # Draw truth boxes
-    for (x1, y1, x2, y2) in truth_boxes.squeeze(0):
-        start_point = (int(x1), int(y1))
-        end_point = (int(x2), int(y2))
-        image = cv2.rectangle(image, start_point, end_point, truth_color, thickness)
+    if truth_boxes is not None:
+        for (x1, y1, x2, y2) in truth_boxes.squeeze(0):
+            start_point = (int(x1), int(y1))
+            end_point = (int(x2), int(y2))
+            image = cv2.rectangle(image, start_point, end_point, truth_color, thickness)
 
     # Draw predicted boxes
-    for (x1, y1, x2, y2) in pred_boxes.squeeze(1):
-        pred_color = (random.randint(0, 255), random.randint(0, 100), random.randint(0, 255))
-        start_point = (int(x1), int(y1))
-        end_point = (int(x2), int(y2))
-        image = cv2.rectangle(image, start_point, end_point, pred_color, thickness)
+    if pred_boxes is not None:
+        for (x1, y1, x2, y2) in pred_boxes.squeeze(1):
+            pred_color = (random.randint(0, 255), random.randint(0, 100), random.randint(0, 255))
+            start_point = (int(x1), int(y1))
+            end_point = (int(x2), int(y2))
+            image = cv2.rectangle(image, start_point, end_point, pred_color, thickness)
 
     start_display_process(image, epoch, i)
 
@@ -106,7 +105,7 @@ def start_display_process(image, epoch, i):
     folder = "./backend/training_data/verify/epoch " + str(epoch)
     if not os.path.exists(folder):
         os.makedirs(folder)
-    display_process = multiprocessing.Process(target=save_image, args=(image, folder + "/Image " + str(i)))
-    display_process.start()
-    display_process.join()  # Wait for the process to close if needed
+    save_image(image, folder + "/Image " + str(i))
+    #display_process.start()
+    #display_process.join()  # Wait for the process to close if needed
 

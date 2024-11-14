@@ -909,11 +909,10 @@ def yolo_to_corners_batches(boxes):
 
     return corners
 
-def clipBoxes(pred_boxes, target_boxes):
+def clipBoxes(target_boxes):
     # Clipping coordinates using the custom ClampBoxCoords function
-    clipped_pred_boxes = ClampBoxCoords.apply(pred_boxes, 0, Constants.desired_size)
     clipped_target_boxes = ClampBoxCoords.apply(target_boxes, 0, Constants.desired_size)
-    return clipped_pred_boxes, clipped_target_boxes
+    return clipped_target_boxes
 
 
 def fix_box_coordinates(boxes, epsilon=1):
@@ -1253,7 +1252,7 @@ class CombinedLoss(nn.Module):
             if torch.isnan(pred_boxes[i]).any() or torch.isinf(pred_boxes[i]).any():
                 print(f"NaN or Inf detected in images at step {step}")
 
-            _, target_boxes[i] = clipBoxes(pred_boxes[i],target_boxes[i])
+            target_boxes[i] = clipBoxes(target_boxes[i])
 
             mask = torch.ones(target_boxes[i].shape[0], dtype=torch.bool, device=target_boxes[i].device)
 

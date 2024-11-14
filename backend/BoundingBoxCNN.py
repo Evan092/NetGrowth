@@ -1,7 +1,9 @@
 import json
 import os
+import random
 from charset_normalizer import detect
 import torch
+import time
 import torch.nn as nn
 import torch.optim as optim
 import torchvision
@@ -345,8 +347,9 @@ def extract_top_bboxes2(pred_tensor, max_boxes=35):
 
 def get_nth_image(data_loader, n):
     for i, (images, bboxes, paths) in enumerate(data_loader):
-        if i == n:
-            return images[0], bboxes[0], paths[0]  # Return the nth image and label
+        bboxes = torch.cat(bboxes, dim=1)[n]
+        mask = (bboxes != 0).any(dim=1) 
+        return images[n], bboxes[mask], paths[n]  # Return the nth image and label
     
 
 class ClampBoxCoords(torch.autograd.Function):
@@ -447,31 +450,58 @@ def train(model, loader, criterion, optimizer, optionalLoader=None):
         DisplayImage.draw_bounding_boxes(path, bbox, output, transform)
 
     #for images, bboxes in loader:
-    for batch_idx, (images, bboxes, path) in enumerate(loader):
+    start_time = time.time()
+    for batch_idx, (images, bboxes, _) in enumerate(loader):
+        data_time = time.time() - start_time
         # Forward pass: compute model outputs (bounding box coordinates)
         i+=1
 
-        if (batch_idx == 1 or batch_idx % 30 == 0) and False:
-            image, bbox, path = get_nth_image(optionalLoader, 1)
+        if (batch_idx == 1 or batch_idx % 10 == 0) and True:
+            n = 0
+            image, bbox, path = get_nth_image(optionalLoader, n)
             image = image.to(device)
             image = image.unsqueeze(0)
             bbox = bbox.to(device)
             bbox = bbox.unsqueeze(0)
-            output = model(image)
-            output = output[1][..., :5]
-            output = postprocess_yolo_output(output,loaded_anchor_boxes)
-            #bbox, output, c = filter_and_trim_boxes(output, bbox)
-            pred_boxes = output.reshape(1, -1, 5)  # N = num_anchors * grid_h * grid_w
-            pred_coords = pred_boxes[..., :4]  # [batch_size, N, 4]
-            pred_confidences = pred_boxes[..., 4]  # [batch_size, N]
-            pred_confidences = pred_confidences.view(-1, 1)
+            all_pred_coords = None
+            if True:
+                output = model(image)
+                all_pred_coords = []
+                all_pred_confidences = []
+                for i in range(len(output)):
+                    output[i] = output[i][..., :5]
+                    output[i] = postprocess_yolo_output(output[i],loaded_anchor_boxes[(i * 3):((i + 1) * 3)])
+                    output[i] = output[i].view(1, -1, 5)  # N = num_anchors * grid_h * grid_w
+
+                    output[i][..., :4] = yolo_to_corners_batches(output[i][..., :4])
+                
+                    #bbox, output, c = filter_and_trim_boxes(output, bbox)
+                    pred_boxes = output[i].reshape(1, -1, 5)  # N = num_anchors * grid_h * grid_w
+                    pred_coords = pred_boxes[..., :4]  # [batch_size, N, 4]
+                    pred_confidences = pred_boxes[..., 4]  # [batch_size, N]
+                    pred_confidences = pred_confidences.view(-1, 1)
+
+                    pred_coords =  yolo_to_corners(pred_coords.squeeze(0))
+                    pred_coords, pred_confidences = filter_confidences(pred_coords, pred_confidences)
+                    pred_coords, pred_confidences = apply_nms(pred_coords, pred_confidences)
+
+                    all_pred_coords.append(pred_coords)
+                    all_pred_confidences.append(pred_confidences)
+
+                # Concatenate all the coordinates and confidences along the first dimension
+                all_pred_coords = torch.cat(all_pred_coords, dim=0)  # Shape: (total_boxes, 4)
+                all_pred_confidences = torch.cat(all_pred_confidences, dim=0)  # Shape: (total_boxes, 1)
+
             bbox = fix_box_coordinates(bbox)
-            _, bbox = clipBoxes(pred_coords,bbox)
-            pred_coords =  yolo_to_corners(pred_coords.squeeze(0))
-            pred_coords, pred_confidences = filter_confidences(pred_coords, pred_confidences)
-            pred_coords, pred_confidences = apply_nms(pred_coords, pred_confidences)
-            DisplayImage.draw_bounding_boxes(path, bbox, pred_coords, epoch+1, batch_idx, transform)
-            print("Image taken",epoch+1, batch_idx, pred_coords.shape[0])
+            bbox = clipBoxes(bbox)
+            mean=torch.tensor([0.3490, 0.3219, 0.2957]).to(device)
+            std=torch.tensor([0.2993, 0.2850, 0.2735]).to(device)
+            un_normalized_img = image * std[:, None, None] + mean[:, None, None]
+
+            # Convert to PIL for display
+            rotated_img = transforms.ToPILImage()(image.squeeze(0).clamp(0, 1))
+            DisplayImage.draw_bounding_boxes(rotated_img, bbox.squeeze(), all_pred_coords, epoch+1, batch_idx, n, transform)
+            print("Image taken",epoch+1, batch_idx)
 
         #if torch.isnan(images).any() or torch.isinf(images).any():
             #print(f"NaN or Inf detected in images at batch {batch_idx}")
@@ -505,16 +535,17 @@ def train(model, loader, criterion, optimizer, optionalLoader=None):
         # Accumulate the loss for the current batch
         running_loss += loss.item() * images.size(0)
         total += images.size(0)
-        print(str(running_loss/total))
+        total_time = time.time() - start_time
+        print(str(running_loss/total), f' Data loading time: {data_time:.4f}s, Total batch time: {total_time:.4f}s')
         # Calculate IoU for the batch
-        outputs_trimmed = outputs[1][..., :4]
-        outputs_flat = outputs_trimmed.view(-1, 4)
-        avg_batch_iou  = 0#calculate_valid_iou(outputs_flat, bboxes.view(-1,4))  # IoU between predicted and true boxes
+        #outputs_trimmed = outputs[1][..., :4]
+        #outputs_flat = outputs_trimmed.view(-1, 4)
+        #avg_batch_iou  = 0#calculate_valid_iou(outputs_flat, bboxes.view(-1,4))  # IoU between predicted and true boxes
         #avg_batch_iou = batch_iou.diag().mean().item()  # Average IoU for the batch
         #writer.add_scalar('avg iou', avg_batch_iou, epoch * len(train_loader) + batch_idx)
 
-        total_iou += avg_batch_iou * images.size(0)
-
+        #total_iou += avg_batch_iou * images.size(0)
+        start_time = time.time()
     print()
     # Average loss and IoU per epoch
     #for name, param in model.named_parameters():
@@ -737,11 +768,36 @@ def custom_collate_fn(batch):
     return images, bboxes, paths
 
 
+
+class RandomBrightnessContrast:
+    def __init__(self, brightness=0.2, contrast=0.2, p=0.5):
+        self.color_jitter = transforms.ColorJitter(brightness=brightness, contrast=contrast)
+        self.p = p
+
+    def __call__(self, img):
+        if random.random() < self.p:
+            return self.color_jitter(img)
+        return img
+
+class RandomBlur:
+    def __init__(self, kernel_size=(3, 3), sigma=(0.1, 2.0), p=0.5):
+        self.blur = transforms.GaussianBlur(kernel_size=kernel_size, sigma=sigma)
+        self.p = p
+
+    def __call__(self, img):
+        if random.random() < self.p:
+            return self.blur(img)
+        return img
+
+
+
+
+
 weight_decay = 1e-4
 learning_rate = 0.00005
-learning_rate =8.02e-4
+learning_rate = 0.000660
 alpha=.5
-batch_size = 26
+batch_size = 16
 desired_size=Constants.desired_size
 writer = ""
 loaded_anchor_boxes = None
@@ -749,8 +805,10 @@ loaded_anchor_boxes = None
 transform = transforms.Compose([
     ResizeToMaxDimension(max_dim=desired_size),  # Resize based on max dimension while maintaining aspect ratio
     #transforms.Grayscale(num_output_channels=1),
+    #RandomBrightnessContrast(brightness=0.2, contrast=0.2, p=0.5),
+    #RandomBlur(kernel_size=(3, 3), sigma=(0.1, 2.0), p=0.5),
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.3476, 0.3207, 0.2946], std=[0.3005, 0.2861, 0.2745])
+    transforms.Normalize(mean=[0.3490, 0.3219, 0.2957], std=[0.2993, 0.2850, 0.2735])
 ])
 epoch = 0
 if __name__ == "__main__":
@@ -794,8 +852,8 @@ if __name__ == "__main__":
             test_dataset.setMaxDimensions(desired_size, desired_size)
 
             #test_loader = DataLoader(dataset=test_dataset, batch_size=1, shuffle=False, num_workers=3,prefetch_factor=2,persistent_workers=True, pin_memory=True)
-            train_loader = DataLoader(dataset=train_dataset, batch_size=batch_size, shuffle=True, num_workers=2,prefetch_factor=2,persistent_workers=True,  pin_memory=False, collate_fn=custom_collate_fn)
-            train_loader_verified = DataLoader(dataset=test_dataset, batch_size=64, shuffle=False, num_workers=2,prefetch_factor=2,persistent_workers=True, pin_memory=False, collate_fn=custom_collate_fn)
+            train_loader = DataLoader(dataset=train_dataset, batch_size=batch_size, shuffle=True, num_workers=6,prefetch_factor=2,persistent_workers=True,  pin_memory=True, collate_fn=custom_collate_fn, timeout=0)
+            train_loader_verified = DataLoader(dataset=test_dataset, batch_size=1, shuffle=False, num_workers=1,prefetch_factor=2,persistent_workers=True, pin_memory=True, collate_fn=custom_collate_fn)
 
             # Compute max_boxes from both training and test datasets
             #max_boxes_train = compute_max_boxes(train_loader)
@@ -856,8 +914,23 @@ if __name__ == "__main__":
             # Assuming `optimizer` is your optimizer and `device` is your CUDA device (e.g., 'cuda:0')
 
 
+            if False:
+                mean = 0.
+                std = 0.
+                for images, _, _ in train_loader:
+                    batch_samples = images.size(0)  # batch size (the last batch can have smaller size)
+                    images = images.view(batch_samples, images.size(1), -1)
+                    mean += images.mean(2).sum(0)
+                    std += images.std(2).sum(0)
+
+                mean /= len(train_loader.dataset)
+                std /= len(train_loader.dataset)
+
+                print(f"Calculated mean: {mean}")
+                print(f"Calculated std: {std}")
+
             if True:
-                checkpoint = torch.load("model_checkpoint3.pth", map_location=device)
+                checkpoint = torch.load("model_checkpoint19.pth", map_location=device)
                 cnn_model.load_state_dict(checkpoint['model_state_dict'])
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 epoch = checkpoint['epoch']
@@ -869,12 +942,12 @@ if __name__ == "__main__":
                             if isinstance(value, torch.Tensor):  # Only move tensors
                                 optimizer.state[param][key] = value.to(device)
 
-            if True:
+            if False:
                 # Initialize the learning rate finder with model, optimizer, and loss function
                 lr_finder = LRFinder(cnn_model, optimizer, criterion, device=device)
                 cnn_model.train()
 
-                lr_finder.range_test(train_loader, end_lr=0.01, num_iter=600)
+                lr_finder.range_test(train_loader, start_lr=1e-6, end_lr=0.01, num_iter=600)
                 lr_finder.plot()
 
                 plt.savefig('lr_finder_plot.png')  # Saves the plot to a file
@@ -892,7 +965,7 @@ if __name__ == "__main__":
 
 
             # ReduceLROnPlateau for long-term control
-            lr_sequence = [8.02E-04]#, 4.95e-4]#, 6.35e-6]#[3.12E-04]#[1.25e-4]#[7.29e-4]#[2e-4, 1.75E-04, 1.81e-4, 7.29E-04]
+            lr_sequence = [0.00066, 1e-4]#8.02E-04]#,8.02E-04,8.02E-04, 2.70E-06]#, 4.95e-4]#, 6.35e-6]#[3.12E-04]#[1.25e-4]#[7.29e-4]#[2e-4, 1.75E-04, 1.81e-4, 7.29E-04]
             # EPOCH 25: 4.95e-4
 
 
