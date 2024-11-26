@@ -12,12 +12,11 @@ from torch.utils.data import DataLoader
 import torchvision.transforms.functional as F
 from GIoULoss import GIoULoss
 import DisplayImage
-from yolov5.models.yolo import Detect
 from customDataSet import CustomImageDataset
 import torchvision.ops as ops
 from transforms import ResizeToMaxDimension
 from datetime import datetime
-
+from PIL import Image
 from torch.nn.utils.rnn import pad_sequence
 import torch.profiler
 from CombinedLoss import *
@@ -432,25 +431,9 @@ def train(model, loader, criterion, optimizer, optionalLoader=None):
     total = 0
     total_iou = 0.0
     i = 0
-    iou_threshold=0.5
     progress = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100]
 
-    if optionalLoader and False:
-        image, bbox, path = get_nth_image(optionalLoader, 1 ,-1)
-        image = image.to(device)
-        image = image.unsqueeze(0)
-        bbox = bbox.to(device)
-        bbox = bbox.unsqueeze(0)
-        output = model(image)
-        output = postprocess_yolo_output(output)
-        bbox, output, _ = filter_and_trim_boxes(output, bbox)
-        bbox = fix_box_coordinates(bbox)
-        _, bbox = clipBoxes(output,bbox)
-        output =  yolo_to_corners(output, loaded_anchor_boxes)
-        DisplayImage.draw_bounding_boxes(path, bbox, output, transform)
 
-    #for images, bboxes in loader:
-    start_time = time.time()
     for batch_idx, (images, bboxes, _) in enumerate(loader):
         data_time = time.time() - start_time
         # Forward pass: compute model outputs (bounding box coordinates)
@@ -504,7 +487,7 @@ def train(model, loader, criterion, optimizer, optionalLoader=None):
             # Convert to PIL for display
             rotated_img = transforms.ToPILImage()(image.squeeze(0).clamp(0, 1))
             #bbox.squeeze()
-            DisplayImage.draw_bounding_boxes(rotated_img, None, all_pred_coords, epoch+1, batch_idx, n, transform)
+            DisplayImage.draw_bounding_boxes(rotated_img, None, all_pred_coords, epoch+1, batch_idx, n, BBtransform)
             print("Image taken",epoch+1, batch_idx)
 
         #if torch.isnan(images).any() or torch.isinf(images).any():
@@ -773,109 +756,78 @@ def custom_collate_fn(batch):
 
 
 
-class RandomBrightnessContrast:
-    def __init__(self, brightness=0.2, contrast=0.2, p=0.5):
-        self.color_jitter = transforms.ColorJitter(brightness=brightness, contrast=contrast)
-        self.p = p
 
-    def __call__(self, img):
-        if random.random() < self.p:
-            return self.color_jitter(img)
-        return img
-
-class RandomBlur:
-    def __init__(self, kernel_size=(3, 3), sigma=(0.1, 2.0), p=0.5):
-        self.blur = transforms.GaussianBlur(kernel_size=kernel_size, sigma=sigma)
-        self.p = p
-
-    def __call__(self, img):
-        if random.random() < self.p:
-            return self.blur(img)
-        return img
+def pad_to_target_size(image_tensor, target_width, target_height):
+    # Get the current tensor dimensions (assuming shape is [C, W, H])
+    _, height, width = image_tensor.shape
+    
+    # Calculate padding needed for both width and height
+    pad_width = max(0, target_width - width)
+    pad_height = max(0, target_height - height)
+    
+    # Padding is applied as (top, right, bottom, left)
+    PadLeft = random.randint(0, pad_width)
+    PadRight = pad_width - PadLeft
+    PadTop = random.randint(0, pad_height)
+    PadBottom = pad_height - PadTop
 
 
 
+    #padding = (pad_width // 2, pad_height // 2, pad_width - pad_width // 2, pad_height - pad_height // 2)
+    #padding = (pad_height // 2, pad_width // 2, pad_height - pad_height // 2, pad_width - pad_width // 2)
+    padding = (PadLeft, PadRight, PadTop, PadBottom)
+    
+    # Apply padding using F.pad (for tensors), padding must be in (left, right, top, bottom) order
+    padded_image_tensor = F.pad(image_tensor, padding, value=0)
 
 
-weight_decay = 1e-4
-learning_rate = 0.00022#0.0005#3e-6
-alpha=.5
-batch_size = 32
-desired_size=Constants.desired_size
-writer = ""
-loaded_anchor_boxes = None
+    return padded_image_tensor, padding
 
-transform = transforms.Compose([
-    ResizeToMaxDimension(max_dim=desired_size),  # Resize based on max dimension while maintaining aspect ratio
-    #transforms.Grayscale(num_output_channels=1),
-    RandomBrightnessContrast(brightness=0.2, contrast=0.2, p=0.5),
-    RandomBlur(kernel_size=(3, 3), sigma=(0.1, 2.0), p=0.5),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.3490, 0.3219, 0.2957], std=[0.2993, 0.2850, 0.2735])
-])
+def getScales(original_size, new_size):
+    old_width, old_height = original_size
+    new_width, new_height = new_size
+    
+    # Scale factors for resizing
+    scale_x = new_width / old_width
+    scale_y = new_height / old_height
+    
+    return scale_x, scale_y
+
+
+
+
+
+
 epoch = 0
 if __name__ == "__main__":
-            num=1
-            while os.path.exists('runs/YOLO v'+str(num)+' Lr'+str(learning_rate) + " wd" + str(weight_decay) + " a" + str(alpha) + " bs"+str(batch_size)):
-                num += 1
-
-
-            writer = SummaryWriter('runs/YOLO v'+str(num)+' Lr'+str(learning_rate) + " wd" + str(weight_decay) + " a" + str(alpha) + " bs"+str(batch_size))
-            print(writer.log_dir)
-        #learning_rate = 0.001
-        #for j in range(4):
-            #if j%2==1:
-                #learning_rate = learning_rate/2
-            #else:
-                #learning_rate = learning_rate/5
-
-            #writer = SummaryWriter('runs/Lr'+str(learning_rate) + " wd" + str(weight_decay) + " a" + str(alpha) + " bs"+str(batch_size))
-
-        #Mean: tensor([0.3476, 0.3207, 0.2946]), Std: tensor([0.3005, 0.2861, 0.2745])
-
-
-            #train_dataset = torchvision.datasets.MNIST(root='./data', train=True, download=True, transform=transform)
-            #test_dataset = torchvision.datasets.MNIST(root='./data', train=False, download=True, transform=transform)
-
-            torch.set_printoptions(sci_mode=False, precision=4)
             
-                        # Load the anchor boxes from a JSON file
+            means = [0.3490, 0.3219, 0.2957]
+            stds=[0.2993, 0.2850, 0.2735]
+            BBtransform = transforms.Compose([
+                ResizeToMaxDimension(max_dim=Constants.desired_size),  # Resize based on max dimension while maintaining aspect ratio
+                transforms.ToTensor(),
+                transforms.Normalize(mean=means, std=stds)
+            ])
+
+            image_path = input("Please enter the image path: ")
+
+            # Load the image
+            ogImage = Image.open(image_path.strip('"'))#remove quotes from sides of path if included
+            oldSize = (ogImage.height, ogImage.width)
+            image = BBtransform(ogImage)
+            newSize = (image.shape[1], image.shape[2])
+            scale_y, scale_x  = getScales(oldSize, newSize)
+            image, (adjustX1, adjustY1, adjustX2, adjustY2)  = pad_to_target_size(image, Constants.desired_size, Constants.desired_size)
             with open('anchor_boxes.json', 'r') as file:
                 loaded_anchor_boxes = json.load(file)
                 loaded_anchor_boxes = torch.tensor(loaded_anchor_boxes, dtype=torch.float32)
 
-            torch.autograd.set_detect_anomaly(True)
-            train_dataset=CustomImageDataset(img_dir='./backend/training_data/', transform=transform, train=True, anchor_boxes=loaded_anchor_boxes)
-            test_dataset=CustomImageDataset(img_dir='./backend/training_data/', transform=transform, train=False, anchor_boxes=loaded_anchor_boxes)
+
 
 
             loaded_anchor_boxes = loaded_anchor_boxes.to(device)
 
-            train_dataset.setMaxDimensions(desired_size, desired_size)
-            test_dataset.setMaxDimensions(desired_size, desired_size)
-
-            #test_loader = DataLoader(dataset=test_dataset, batch_size=1, shuffle=False, num_workers=3,prefetch_factor=2,persistent_workers=True, pin_memory=True)
-            train_loader = DataLoader(dataset=train_dataset, batch_size=batch_size, shuffle=True, num_workers=4,prefetch_factor=2,persistent_workers=True,  pin_memory=True, collate_fn=custom_collate_fn, timeout=0)
-            train_loader_verified = DataLoader(dataset=test_dataset, batch_size=1, shuffle=False, num_workers=1,prefetch_factor=2,persistent_workers=True, pin_memory=True, collate_fn=custom_collate_fn)
-
-            # Compute max_boxes from both training and test datasets
-            #max_boxes_train = compute_max_boxes(train_loader)
-            #max_boxes_test = compute_max_boxes(test_loader)
-            #max_boxes = max(max_boxes_train, max_boxes_test)
-            max_boxes = Constants.max_boxes
-
-            train_dataset.setMaxBBoxes(max_boxes)
-            test_dataset.setMaxBBoxes(max_boxes)
-
-            #mean, std = get_mean_std_RGB(train_loader)
-            #print(f"Mean: {mean}, Std: {std}")
-
-
-            #cnn_model = YOLOv3(num_classes=1).to(device)# BoundingBoxCnn(max_boxes, loaded_anchor_boxes).to(device)
             cnn_model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=False).to(device)
-
-
-
 
 
             # Access the Detect layer
@@ -895,170 +847,104 @@ if __name__ == "__main__":
                 detect_layer.m[i] = torch.nn.Conv2d(in_channels, Constants.num_anchor_boxes * 6, kernel_size=1)
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
             max_norm = 5
-            #criterion = nn.CrossEntropyLoss()
-            criterion = CombinedLoss(anchor_boxes=loaded_anchor_boxes).to(device)#nn.SmoothL1Loss().to(device)#CombinedLoss().to(device)
-            optimizer = optim.Adam(cnn_model.parameters(), lr=learning_rate, weight_decay=weight_decay) #, weight_decay=5e-4
-            # Warm-up scheduler for the first 10 epochs
-            #warmup_scheduler = LinearLR(optimizer, start_factor=0.01, total_iters=10)
-            # Assuming `optimizer` is your optimizer and `device` is your CUDA device (e.g., 'cuda:0')
+
+            checkpoint = torch.load("model_checkpoint154.pth", map_location=device)
+            cnn_model.load_state_dict(checkpoint['model_state_dict'])
 
 
-            if False:
-                mean = 0.
-                std = 0.
-                for images, _, _ in train_loader:
-                    batch_samples = images.size(0)  # batch size (the last batch can have smaller size)
-                    images = images.view(batch_samples, images.size(1), -1)
-                    mean += images.mean(2).sum(0)
-                    std += images.std(2).sum(0)
 
-                mean /= len(train_loader.dataset)
-                std /= len(train_loader.dataset)
 
-                print(f"Calculated mean: {mean}")
-                print(f"Calculated std: {std}")
 
+
+            image = image.to(device)
+            image = image.unsqueeze(0)
+
+            all_pred_coords = None
             if True:
-                checkpoint = torch.load("model_checkpoint91.pth", map_location=device)
-                cnn_model.load_state_dict(checkpoint['model_state_dict'])
-                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                epoch = checkpoint['epoch']
-                loss = checkpoint['loss']
-                for param_group in optimizer.param_groups:
-                    for param in param_group['params']:
-                        state = optimizer.state[param]
-                        for key, value in state.items():
-                            if isinstance(value, torch.Tensor):  # Only move tensors
-                                optimizer.state[param][key] = value.to(device)
+                output = cnn_model(image)
+                all_pred_coords = []
+                all_pred_confidences = []
+                for i in range(len(output)):
+                    output[i] = output[i][..., :5]
+                    output[i] = postprocess_yolo_output(output[i],loaded_anchor_boxes[(i * 3):((i + 1) * 3)])
+                    output[i] = output[i].view(1, -1, 5)  # N = num_anchors * grid_h * grid_w
 
-                for param_group in optimizer.param_groups:
-                    param_group['lr'] = learning_rate
-
-            if False:
-                # Initialize the learning rate finder with model, optimizer, and loss function
-                lr_finder = LRFinder(cnn_model, optimizer, criterion, device=device)
-                cnn_model.train()
-
-                lr_finder.range_test(train_loader, start_lr=1e-9, end_lr=0.001, num_iter=100)
-                lr_finder.plot()
-
-                plt.savefig('lr_finder_plot.png')  # Saves the plot to a file
-                plt.show()  # Display the plot (optional)
-
-                # Convert the loss list to a PyTorch Tensor
-                losses_tensor = torch.tensor(lr_finder.history["loss"])
-
-                # Find the index of the minimum loss
-                min_loss_idx = torch.argmin(losses_tensor)
-
-                # Retrieve the corresponding learning rate
-                optimal_lr = lr_finder.history["lr"][min_loss_idx.item()]  # Use .item() to get Python scalar
-                print(f"Optimal Learning Rate: {optimal_lr}")
-
-
-            # ReduceLROnPlateau for long-term control
-            lr_sequence = [1.08E-09]#[0.00066, 1e-4]#8.02E-04]#,8.02E-04,8.02E-04, 2.70E-06]#, 4.95e-4]#, 6.35e-6]#[3.12E-04]#[1.25e-4]#[7.29e-4]#[2e-4, 1.75E-04, 1.81e-4, 7.29E-04]
-            # EPOCH 25: 4.95e-4
-
-
-            warmup_steps = len(lr_sequence)
-            warmup_scheduler = WarmupScheduler(optimizer, warmup_steps, lr_sequence)
-
-            # Initialize ReduceLROnPlateau scheduler
-            plateau_scheduler = ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5, threshold=0.01)
-
-            # Combine both schedulers
-            #scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, plateau_scheduler], milestones=[10])
-
-
-
-            num_epochs = 200
-            print()
-
-
-            print(f"Batch_Size={batch_size}")
-            print(f"max_boxes={max_boxes}")
-            print(f"weight_decay={weight_decay}")
-            print(f"learning_rate={learning_rate}")
-            print(f"max_norm={max_norm}")
-            print(f"desired_size={desired_size}")
-            print(f"alpha={alpha}")
-            #print("Loss Function: (alpha*diou_loss_value+(1-alpha)*(smooth_l1_loss_value/desired_size))*(desired_size/2)")
-            print(f"Using device: {device}")
-            print(f"Is CUDA available: {torch.cuda.is_available()}")
-
-            #test_loss, test_acc = evaluate(cnn_model, test_loader, criterion)
-            #print(f'Test Loss: {test_loss:.4f}, Test Acc: {test_acc:.2f}%')
-            #torch.autograd.set_detect_anomaly(True)
-            while epoch < num_epochs:
-                #in_warmup = warmup_scheduler.step() if epoch < warmup_steps else False
-
-                #torch.nn.utils.clip_grad_norm_(cnn_model.parameters(), max_norm=max_norm)
-                print(f'==========Epoch [{epoch+1}/{num_epochs}] =========')
-                print(f'Training Progress ({datetime.now().strftime("%Y-%m-%d %H:%M:%S")}):')
-                train_loss, train_acc = train(cnn_model, train_loader, criterion, optimizer, optionalLoader=train_loader_verified)
-                print(f'Evaluation Progress ({datetime.now().strftime("%Y-%m-%d %H:%M:%S")}):')
-                test_loss, test_acc = 0,0 #evaluate(cnn_model, test_loader, criterion)
-                print(f'Finished. ({datetime.now().strftime("%Y-%m-%d %H:%M:%S")})\n'
-                f'Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}% - '
-                    f'Test Loss: {test_loss:.4f}, Test Acc: {test_acc:.2f}%')
-
-                print(f'Current Learning Rate: {optimizer.param_groups[0]["lr"]:.6f}', end=" & ")
-
-                # Update learning rate based on test loss
+                    output[i][..., :4] = yolo_to_corners_batches(output[i][..., :4])
                 
-                #if not in_warmup:
-                plateau_scheduler.step(train_loss)
+                    #bbox, output, c = filter_and_trim_boxes(output, bbox)
+                    pred_boxes = output[i].reshape(1, -1, 5)  # N = num_anchors * grid_h * grid_w
+                    pred_coords = pred_boxes[..., :4]  # [batch_size, N, 4]
+                    pred_confidences = pred_boxes[..., 4]  # [batch_size, N]
+                    pred_confidences = pred_confidences.view(-1, 1)
 
-                # Print the updated learning rate
-                print(f'New Learning Rate: {optimizer.param_groups[0]["lr"]:.6f}')
+                    #pred_coords =  #yolo_to_corners(pred_coords.squeeze(0))
+                    pred_coords, pred_confidences = filter_confidences(pred_coords.squeeze(0), pred_confidences)
+                    #pred_coords, pred_confidences = apply_nms(pred_coords, pred_confidences)
 
-                #print(f'Current Alpha: {alpha}', end=" & ")
-                #alpha = min(alpha + ((1-alpha)/20), 1)
-                #criterion.updateAlpha(alpha)
-                #print(f'New Alpha: {alpha}')
-                # Save after the first epoch
-                torch.save({
-                    'epoch': epoch+1,
-                    'model_state_dict': cnn_model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'loss': train_loss,
-                }, "model_checkpoint"+str(epoch+1)+".pth")
+                    all_pred_coords.append(pred_coords)
+                    all_pred_confidences.append(pred_confidences)
+
+                # Concatenate all the coordinates and confidences along the first dimension
+                all_pred_coords = torch.cat(all_pred_coords, dim=0)  # Shape: (total_boxes, 4)
+                all_pred_confidences = torch.cat(all_pred_confidences, dim=0)  # Shape: (total_boxes, 1)
+
+            all_pred_coords, all_pred_confidences = apply_nms(all_pred_coords, all_pred_confidences, 0.7)
+            all_pred_coords, all_pred_confidences = apply_nms(all_pred_coords, all_pred_confidences, 0.3)
+
+            mean=torch.tensor(means).to(device)
+            std=torch.tensor(stds).to(device)
+            un_normalized_img = image * std[:, None, None] + mean[:, None, None]
+
+            # Convert to PIL for display
+            rotated_img = transforms.ToPILImage()(image.squeeze(0).clamp(0, 1))
+            #bbox.squeeze()
+            path = DisplayImage.draw_bounding_boxes(rotated_img, None, all_pred_coords, 0,0, 0, BBtransform)
+            print("Image of bounding boxes taken, stored in path:")
+            print(path)
+
+            #"C:\Users\evans\Desktop\Semester Projects\NetGrowth\backend\training_data\test\1c908cd87852e244.jpg"
+
+            CRNNtransform = transforms.Compose([
+            transforms.ToTensor(),
+            #transforms.Normalize(mean=[0.3490, 0.3219, 0.2957], std=[0.2993, 0.2850, 0.2735])
+        ])
 
 
-                print(f".....................................................{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}")
-                # After the last epoch, ask if the user wants to add more epochs
-                if epoch == num_epochs - 1:
-                    user_input = input("Training completed. Would you like to add more epochs? (yes/no): ").strip().lower()
-                    if user_input == 'yes':
-                        num_epochs += int(input("Please enter a number: "))  # Add 10 more epochs
-                    else:
-                        print(f"Training finished after {epoch+1} epochs.")
-                epoch += 1
+
+            bboxes = []
+            for bbox in all_pred_coords:
+                thisImage = ogImage.copy()
+                scale_y, scale_x  = getScales(newSize, oldSize)
+                thisBox = [0,0,0,0]
+                thisBox[0] = (bbox[0]*scale_x) - adjustX1
+                thisBox[1] = (bbox[1]*scale_y) - adjustY1
+                thisBox[2] = (bbox[2]*scale_x) - adjustX1
+                thisBox[3] = (bbox[3]*scale_y) - adjustY1
+                bboxes.append(thisBox)
+
+            all_pred_coords = torch.cat(bboxes, dim=0)
 
 
-            #del test_loader
-            del train_loader
-            del train_dataset
-            del test_dataset
+            path = DisplayImage.draw_bounding_boxes(rotated_img, None, all_pred_coords, 0,1, 0, BBtransform)
+            print("Image of bounding boxes taken, stored in path:")
+            print(path)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
             del cnn_model
-            del criterion
-            del optimizer
-            del writer
             gc.collect()
             #test_loss, test_acc = evaluate(cnn_model, test_loader, criterion)
             #print("\nFinal Evaluation on Test Set:")

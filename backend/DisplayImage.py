@@ -46,7 +46,7 @@ def resize_and_pad_deprecated(image, desired_size, color=(0, 0, 0)):
 
 epoch = 0
 i = 0
-def draw_bounding_boxes(image, truth_boxes, pred_boxes, epoch1, i1, n, transform=None, truth_color=(0, 255, 0), pred_color=(255, 0, 0), thickness=2):
+def draw_bounding_boxes(image, truth_boxes, pred_boxes, epoch1, i1, n, transform=None, truth_color=(255, 0, 0), pred_color=(0, 255, 0), thickness=2):
     """
     Draw truth and predicted bounding boxes on an image and display it.
 
@@ -77,12 +77,11 @@ def draw_bounding_boxes(image, truth_boxes, pred_boxes, epoch1, i1, n, transform
     # Draw predicted boxes
     if pred_boxes is not None:
         for (x1, y1, x2, y2) in pred_boxes.squeeze(1):
-            pred_color = (random.randint(0, 255), random.randint(0, 100), random.randint(0, 255))
             start_point = (int(x1), int(y1))
             end_point = (int(x2), int(y2))
             image = cv2.rectangle(image, start_point, end_point, pred_color, thickness)
 
-    start_display_process(image, epoch, i)
+    return start_display_process(image, epoch, i)
 
 def display_image(image):
     """Display an image using matplotlib."""
@@ -106,6 +105,7 @@ def start_display_process(image, epoch, i):
     if not os.path.exists(folder):
         os.makedirs(folder)
     save_image(image, folder + "/Image " + str(i))
+    return (folder + "/Image " + str(i))
     #display_process.start()
     #display_process.join()  # Wait for the process to close if needed
 

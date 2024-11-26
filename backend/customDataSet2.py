@@ -172,9 +172,10 @@ class CustomImageDataset2(Dataset):
                 scale_x, scale_y = self.getScales(oldSize, newSize)
 
                 # Pad the image to the desired size
-                image_tensor, padding = self.pad_to_target_size(
-                    image_tensor, self.maxWidth, self.maxHeight
-                )
+                #image_tensor, padding = self.pad_to_target_size(
+                #    image_tensor, self.maxWidth, self.maxHeight
+                #)
+                padding = (0,0,0,0)
                 # padding should be a tuple of 4 elements: (PadLeft, PadTop, PadRight, PadBottom)
                 if len(padding) != 4:
                     raise ValueError(f"Expected padding to have 4 elements, got {len(padding)}: {padding}")
@@ -218,13 +219,13 @@ class CustomImageDataset2(Dataset):
             bbox[3] = (bbox[3]*scale_y) + adjustY1
 
             # Rotate the bounding box to match the image rotation
-            bbox = RandomRotationWithBBox.rotateBBox(bbox, -total_angle)
+            bbox = RandomRotationWithBBox.rotateBBox(newSize, bbox, -total_angle)
 
             # Convert bounding box coordinates to integers and ensure they are within image bounds
             x_min_crop = max(0, int(round(bbox[0])))
             y_min_crop = max(0, int(round(bbox[1])))
-            x_max_crop = min(self.maxWidth, int(round(bbox[2])))
-            y_max_crop = min(self.maxHeight, int(round(bbox[3])))
+            x_max_crop = min(newSize[0], int(round(bbox[2])))
+            y_max_crop = min(newSize[1], int(round(bbox[3])))
 
             width_crop = x_max_crop - x_min_crop
             height_crop = y_max_crop - y_min_crop
@@ -275,11 +276,11 @@ class RandomRotationWithBBox:
         return img_tensor, angle
 
     @staticmethod
-    def rotateBBox(box, angle):
+    def rotateBBox(imgSize, box, angle):
         if angle == 0:
             return box  # No rotation needed
 
-        w, h = Constants.desired_size, Constants.desired_size
+        (w, h) = imgSize
         x_min, y_min, x_max, y_max = box
 
         # Define the center of the image

@@ -8,6 +8,7 @@ import Constants
 from GIoULoss import GIoULoss
 import torch
 import torch.nn.functional as F
+from torchvision.ops import box_iou
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
@@ -166,14 +167,36 @@ def calculate_target_conf(pred_boxes, gt_boxes, iou_threshold=0.5):
     Returns:
         target_conf (Tensor): Tensor of shape (batch_size, n) with values 0 or 1.
     """
-    # Calculate IoUs between all predicted boxes and ground truth boxes for each batch element
-    ious = calculate_iou_batch(pred_boxes, gt_boxes)  # Shape: (batch_size, n, m)
-    
-    # Determine maximum IoU for each predicted box in the batch
-    max_ious, _ = ious.max(dim=2)  # Shape: (batch_size, n)
+    batch_size = pred_boxes.size(0)
+    num_preds = pred_boxes.size(1)
+    target_conf = []
 
-    # Assign confidence based on IoU threshold
-    target_conf = (max_ious >= iou_threshold).float()  # Shape: (batch_size, n)
+    for i in range(batch_size):
+        pred_boxes_i = pred_boxes[i]  # Shape: [n, 4]
+        gt_boxes_i = gt_boxes[i]      # Shape: [m, 4]
+
+        # Filter out zero padding in gt_boxes_i
+        valid_gt_mask = gt_boxes_i.sum(dim=1) > 0
+        gt_boxes_i = gt_boxes_i[valid_gt_mask]
+
+        if gt_boxes_i.numel() == 0:
+            # If there are no ground truth boxes, assign zero confidence
+            target_conf.append(torch.zeros(num_preds, device=pred_boxes.device))
+            continue
+
+        # Compute IoU between predicted boxes and ground truth boxes
+        ious = box_iou(pred_boxes_i, gt_boxes_i)  # Shape: [n, m]
+
+        # Determine maximum IoU for each predicted box
+        max_ious, _ = ious.max(dim=1)  # Shape: [n]
+
+        # Assign confidence based on IoU threshold
+        target_conf_i = (max_ious >= iou_threshold).float()  # Shape: [n]
+
+        target_conf.append(target_conf_i)
+
+    # Stack the list of tensors into a single tensor
+    target_conf = torch.stack(target_conf, dim=0)  # Shape: [batch_size, n]
 
     return target_conf
 
@@ -1178,7 +1201,8 @@ class CombinedLoss(nn.Module):
         self.IoUScale = 0 # Weight of IoU loss
         self.DIoUScale = 0.95 #Weight of DIoU loss
         self.SmoothL1LossScale = 1.4 #Weight of SmoothL1Loss
-        self.BCEScale = 0.01
+        self.BCEScale = 0.05
+        self.PostMatchBCEScale = 0.02
 
         self.confidenceScale = 1.0 #Weight of our Confidence levels
         self.incorrectAreaScale = 0.1
@@ -1194,7 +1218,7 @@ class CombinedLoss(nn.Module):
         self.outOfBoundsPenaltyScale = 0.05
 
                 #Weight = [small, medium, large]
-        self.weight_SmoothL1Loss = [6, 1.5, 0.5]
+        self.weight_SmoothL1Loss = [0,0,0]#[6, 1.5, 0.5]
         self.weight_BCELoss = [1,1,1]
         self.weight_DIOULoss = [1.1,1.1,1.2]
         self.weight_tp = [10,1,0.5]
@@ -1254,6 +1278,9 @@ class CombinedLoss(nn.Module):
 
             target_boxes[i] = clipBoxes(target_boxes[i])
 
+            temp2 = (calculate_target_conf(pred_boxes[i][..., :4].unsqueeze(0), target_boxes[i].unsqueeze(0)))
+            bce_loss_value2 = (self.bce_loss(confidences_flat[i], temp2.squeeze(0).unsqueeze(1)))
+
             mask = torch.ones(target_boxes[i].shape[0], dtype=torch.bool, device=target_boxes[i].device)
 
             pad_size = target_boxes[i].shape[0]-pred_boxes[i].shape[0]
@@ -1285,17 +1312,20 @@ class CombinedLoss(nn.Module):
             diou_loss_value_scaled = diou_loss_value * self.DIoUScale* self.weight_DIOULoss[i]
             smooth_l1_loss_scaled = ((smooth_l1_loss_value * self.SmoothL1LossScale).mean(dim=1, keepdim=True).squeeze(-1) * mask)* self.weight_SmoothL1Loss[i]
             bce_loss_scaled = (bce_loss_value * self.BCEScale) * self.weight_BCELoss[i]
+            bce_loss_scaled2 = (bce_loss_value2 * self.PostMatchBCEScale) * self.weight_BCELoss[i]
 
             maxLoss = self.IoUScale + self.DIoUScale + self.SmoothL1LossScale + self.BCEScale
 
             diou_loss_value_average = diou_loss_value_scaled.sum()/mask.float().sum()
             smooth_l1_loss_average = smooth_l1_loss_scaled.sum() /mask.float().sum()
             bce_loss_average = bce_loss_scaled.mean() #/mask.float().sum()
+            bce_loss_average2 = bce_loss_scaled2.mean() #/mask.float().sum()
 
             total_loss = (
                 (diou_loss_value_average ) +
                 (smooth_l1_loss_average ) +
                 (bce_loss_average) +
+                (bce_loss_average2) +
                 (tp )
             ) 
             
@@ -1309,6 +1339,7 @@ class CombinedLoss(nn.Module):
                 writer.add_scalar('avg Confidence'+str(i), confidences_flat[i].mean(), step)
                 writer.add_scalar('avg Coordinate'+str(i), pred_boxes[i].mean(), step)
                 writer.add_scalar('BCE Loss'+str(i), bce_loss_average.item(), step)
+                writer.add_scalar('Matched BCE Loss'+str(i), bce_loss_average2.item(), step)
                 #writer.add_scalar('Negative Penalty', negative_penalty_loss, step)
                 #writer.add_scalar('Too Big Penalty', outOfBoundsPenalty, step)
                 #writer.add_scalar('iou_loss_value', iou_loss_value_scaled.mean(), step)

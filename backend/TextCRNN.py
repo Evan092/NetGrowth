@@ -1,3 +1,4 @@
+import random
 import torch
 import torch.nn as nn
 import torchvision.models as models
@@ -148,7 +149,7 @@ def custom_collate_fn(batch):
 
     return images, texts
 
-
+printing = True
 def train(model, loader, criterion, optimizer, epoch):
     model.train()
     running_loss = 0.0
@@ -184,7 +185,7 @@ def train(model, loader, criterion, optimizer, epoch):
         running_loss += loss.item()
         total_batches += 1
 
-        if batch_idx % 1 == 0:
+        if printing:
             _, preds = outputs.max(2)
             preds = preds.transpose(1, 0).contiguous()  # [N, T]
             pred_texts = label_encoder.decode(preds)
@@ -212,7 +213,7 @@ def evaluate(model, loader, criterion):
     total_chars = 0
 
     with torch.no_grad():
-        for images, texts in loader:
+        for batch_idx, (images, texts) in enumerate(loader):
             if images is None or texts is None:
                 continue  # Skip invalid samples
 
@@ -230,11 +231,9 @@ def evaluate(model, loader, criterion):
             # Prepare input lengths
             batch_size = images.size(0)
             seq_len = outputs.size(0)
-            input_lengths = torch.full(
-                size=(batch_size,), fill_value=seq_len, dtype=torch.long
-            ).to(device)
+            input_lengths = torch.full(size=(batch_size,), fill_value=seq_len, dtype=torch.long, device=device)
 
-            # Compute CTC loss
+            # Compute loss
             loss = criterion(outputs, targets, input_lengths, target_lengths)
 
             running_loss += loss.item()
@@ -244,6 +243,19 @@ def evaluate(model, loader, criterion):
             _, preds = outputs.max(2)
             preds = preds.transpose(1, 0).contiguous()  # [N, T]
             pred_texts = label_encoder.decode(preds)
+
+            if printing:
+                target_text = texts[0] if len(texts) > 0 else ''
+                predicted_text = pred_texts[0] if len(pred_texts) > 0 else ''
+                print(
+                    f"Epoch [{epoch+1}], Batch [{batch_idx+1}/{len(loader)}], epoch loss: {running_loss / total_batches} , Loss: {loss.item():.4f}, "
+                    f"Target: '{target_text}', Predicted: '{predicted_text}'"
+                )
+                rotated_img = transforms.ToPILImage()(images[0].squeeze(0).clamp(0, 1))
+                folder = "./backend/training_data/verify/text epoch " + str(epoch)
+                if not os.path.exists(folder):
+                    os.makedirs(folder)
+                rotated_img.save(folder + "/" + str(batch_idx) + ".png")
 
             # Calculate character-level accuracy
             for pred_text, target_text in zip(pred_texts, texts):
@@ -297,11 +309,36 @@ class WrappedCTCLoss(nn.Module):
         loss = self.ctc_loss(outputs, targets, input_lengths, target_lengths)
 
         return loss
+    
+
+
+class RandomBrightnessContrast:
+    def __init__(self, brightness=0.2, contrast=0.2, p=0.5):
+        self.color_jitter = transforms.ColorJitter(brightness=brightness, contrast=contrast)
+        self.p = p
+
+    def __call__(self, img):
+        if random.random() < self.p:
+            return self.color_jitter(img)
+        return img
+
+class RandomBlur:
+    def __init__(self, kernel_size=(3, 3), sigma=(0.1, 2.0), p=0.5):
+        self.blur = transforms.GaussianBlur(kernel_size=kernel_size, sigma=sigma)
+        self.p = p
+
+    def __call__(self, img):
+        if random.random() < self.p:
+            return self.blur(img)
+        return img
+
+
+
 
 if __name__ == '__main__':
-    batch_size = 64
-    learning_rate = 4e-5
-    weight_decay = 1e-4
+    batch_size = 1
+    learning_rate = 0.0001#4e-5
+    weight_decay = 3.7e-5
     num_epochs = 1000
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -312,7 +349,9 @@ if __name__ == '__main__':
 
     # Transforms
     transform = transforms.Compose([
-        ResizeToMaxDimension(max_dim=Constants.desired_size),  # Resize based on max dimension while maintaining aspect ratio
+        #ResizeToMaxDimension(max_dim=Constants.desired_size),  # Resize based on max dimension while maintaining aspect ratio
+        RandomBrightnessContrast(brightness=0.2, contrast=0.2, p=0.5),
+        RandomBlur(kernel_size=(3, 3), sigma=(0.1, 2.0), p=0.5),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.3490, 0.3219, 0.2957], std=[0.2993, 0.2850, 0.2735])
     ])
@@ -324,8 +363,8 @@ if __name__ == '__main__':
 
     #verify_char_set(train_dataset,label_encoder)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4,prefetch_factor=8,persistent_workers=True, pin_memory=True, collate_fn=custom_collate_fn)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4,prefetch_factor=2,persistent_workers=True, pin_memory=True,  collate_fn=custom_collate_fn)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=1,prefetch_factor=2,persistent_workers=True, pin_memory=True, collate_fn=custom_collate_fn)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=1,prefetch_factor=2,persistent_workers=True, pin_memory=True,  collate_fn=custom_collate_fn)
 
     # Model, criterion, optimizer
     num_classes = len(Constants.char_set) + 1  # +1 for CTC blank label
@@ -337,7 +376,7 @@ if __name__ == '__main__':
     writer = SummaryWriter()
 
     if True:
-        checkpoint = torch.load("bkCRNNmodel_checkpoint_5.pth", map_location=device)
+        checkpoint = torch.load("CRNNmodel_checkpoint_7.pth", map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         epoch = checkpoint['epoch']
@@ -349,6 +388,8 @@ if __name__ == '__main__':
                     if isinstance(value, torch.Tensor):  # Only move tensors
                         optimizer.state[param][key] = value.to(device)
 
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = learning_rate
 
     if False:
             # Initialize the learning rate finder with model, optimizer, and loss function
@@ -356,7 +397,7 @@ if __name__ == '__main__':
             lr_finder = LRFinder(model, optimizer, lrCriterion, device=device)
             model.train()
 
-            lr_finder.range_test(train_loader, start_lr=1e-6, end_lr=0.01, num_iter=600)
+            lr_finder.range_test(train_loader, start_lr=1e-7, end_lr=0.001, num_iter=600)
             lr_finder.plot()
 
             plt.savefig('lr_finder_plot.png')  # Saves the plot to a file
@@ -374,12 +415,12 @@ if __name__ == '__main__':
 
     # Training loop
     for epoch in range(num_epochs):
-        train_loss = train(model, train_loader, criterion, optimizer, epoch)
-        #val_loss, val_acc = evaluate(model, test_loader, criterion)
-        print(f'Epoch [{epoch+1}/{num_epochs}], Train Loss: {train_loss:.4f}')#, Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%')
+        #train_loss = train(model, train_loader, criterion, optimizer, epoch)
+        val_loss, val_acc = evaluate(model, test_loader, criterion)
+        print(f'Epoch [{epoch+1}/{num_epochs}], Train Loss: {test_loader:.4f}')#, Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%')
 
         # Log to TensorBoard
-        writer.add_scalar('Loss/Train', train_loss, epoch)
+        writer.add_scalar('Loss/Train', test_loader, epoch)
         #writer.add_scalar('Loss/Validation', val_loss, epoch)
         #writer.add_scalar('Accuracy/Validation', val_acc, epoch)
 
