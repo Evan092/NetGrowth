@@ -10,13 +10,15 @@ import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 import torchvision.transforms.functional as F
+from torchvision.transforms.functional import crop
 from GIoULoss import GIoULoss
 import DisplayImage
+from TextCRNN import CRNN, LabelEncoder
 from customDataSet import CustomImageDataset
 import torchvision.ops as ops
 from transforms import ResizeToMaxDimension
 from datetime import datetime
-from PIL import Image
+from PIL import Image, ExifTags
 from torch.nn.utils.rnn import pad_sequence
 import torch.profiler
 from CombinedLoss import *
@@ -714,48 +716,6 @@ def compute_max_boxes(dataloader):
                 max_boxes = num_boxes
     return max_boxes
 
-def custom_collate_fn(batch):
-    images, bboxes, paths = zip(*batch)
-    
-    # Stack images directly (assuming they are all the same size)
-    images = torch.stack(images, dim=0)
-    
-    # Prepare lists to hold padded bounding boxes for each scale
-    small_scale_boxes = []
-    medium_scale_boxes = []
-    large_scale_boxes = []
-    
-    # Find the maximum number of boxes in each scale across the batch
-    max_small_boxes = max(b[0].shape[0] for b in bboxes)
-    max_medium_boxes = max(b[1].shape[0] for b in bboxes)
-    max_large_boxes = max(b[2].shape[0] for b in bboxes)
-    
-    # Pad each scale's bounding boxes and store in the respective list
-    for b in bboxes:
-        # Pad small scale boxes
-        padded_small = torch.cat([b[0], torch.zeros(max_small_boxes - b[0].shape[0], 4)], dim=0) if b[0].shape[0] < max_small_boxes else b[0]
-        small_scale_boxes.append(padded_small)
-        
-        # Pad medium scale boxes
-        padded_medium = torch.cat([b[1], torch.zeros(max_medium_boxes - b[1].shape[0], 4)], dim=0) if b[1].shape[0] < max_medium_boxes else b[1]
-        medium_scale_boxes.append(padded_medium)
-        
-        # Pad large scale boxes
-        padded_large = torch.cat([b[2], torch.zeros(max_large_boxes - b[2].shape[0], 4)], dim=0) if b[2].shape[0] < max_large_boxes else b[2]
-        large_scale_boxes.append(padded_large)
-    
-    # Stack each scale's bounding boxes along the batch dimension
-    small_scale_boxes = torch.stack(small_scale_boxes, dim=0)#.to(device)
-    medium_scale_boxes = torch.stack(medium_scale_boxes, dim=0)#.to(device)
-    large_scale_boxes = torch.stack(large_scale_boxes, dim=0)#.to(device)
-    
-    # Combine scales into a single tensor of shape (batch_size, 3, max_boxes, 4)
-    bboxes = [small_scale_boxes, medium_scale_boxes, large_scale_boxes]
-    
-    return images, bboxes, paths
-
-
-
 
 def pad_to_target_size(image_tensor, target_width, target_height):
     # Get the current tensor dimensions (assuming shape is [C, W, H])
@@ -795,7 +755,34 @@ def getScales(original_size, new_size):
 
 
 
+def custom_collate_fn(batch):
+    # Define consistent transformations
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        #transforms.Normalize(mean=[0.3490, 0.3219, 0.2957], std=[0.2993, 0.2850, 0.2735])
+    ])
 
+
+    max_width = max([img.shape[2] for img in batch])
+    processed_images = []
+    for img in batch:
+        padding = (0, max_width - img.shape[2], 0, 0)
+        padded_img = F.pad(img, padding, value=0.5)
+        processed_images.append(padded_img)
+
+    # Stack images into a tensor of shape [batch_size, channels, height, width]
+    images = torch.stack(processed_images, dim=0)
+    return images
+
+def sanitize_filename(filename):
+    """
+    Remove or replace invalid characters in a filename.
+    """
+    # List of characters not allowed in file names
+    invalid_chars = r'<>:"/\|?*'
+    for char in invalid_chars:
+        filename = filename.replace(char, "_")  # Replace invalid characters with underscores
+    return filename
 
 
 epoch = 0
@@ -813,11 +800,50 @@ if __name__ == "__main__":
 
             # Load the image
             ogImage = Image.open(image_path.strip('"'))#remove quotes from sides of path if included
+
+
+
+            try:
+                # Get EXIF data
+                exif = ogImage._getexif()
+
+                if exif is not None:
+                    # Find the orientation tag
+                    for tag, value in ExifTags.TAGS.items():
+                        if value == "Orientation":
+                            orientation_tag = tag
+                            break
+
+                    # Get orientation and apply corrections if needed
+                    orientation = exif.get(orientation_tag)
+
+                    if orientation == 3:
+                        ogImage = ogImage.rotate(180, expand=True)
+                    elif orientation == 6:
+                        ogImage = ogImage.rotate(270, expand=True)
+                    elif orientation == 8:
+                        ogImage = ogImage.rotate(90, expand=True)
+            except Exception as e:
+                print(f"EXIF handling error: {e}")
+
+
+
+
+
+
+
+
+
+
+
+
+
             oldSize = (ogImage.height, ogImage.width)
+            ogImage = ogImage.convert("RGB")
             image = BBtransform(ogImage)
             newSize = (image.shape[1], image.shape[2])
             scale_y, scale_x  = getScales(oldSize, newSize)
-            image, (adjustX1, adjustY1, adjustX2, adjustY2)  = pad_to_target_size(image, Constants.desired_size, Constants.desired_size)
+            image, (adjustX1, adjustX2, adjustY1, adjustY2)  = pad_to_target_size(image, Constants.desired_size, Constants.desired_size)
             with open('anchor_boxes.json', 'r') as file:
                 loaded_anchor_boxes = json.load(file)
                 loaded_anchor_boxes = torch.tensor(loaded_anchor_boxes, dtype=torch.float32)
@@ -849,7 +875,7 @@ if __name__ == "__main__":
 
             max_norm = 5
 
-            checkpoint = torch.load("model_checkpoint154.pth", map_location=device)
+            checkpoint = torch.load("model_checkpoint184.pth", map_location=device)
             cnn_model.load_state_dict(checkpoint['model_state_dict'])
 
 
@@ -879,7 +905,7 @@ if __name__ == "__main__":
                     pred_confidences = pred_confidences.view(-1, 1)
 
                     #pred_coords =  #yolo_to_corners(pred_coords.squeeze(0))
-                    pred_coords, pred_confidences = filter_confidences(pred_coords.squeeze(0), pred_confidences)
+                    pred_coords, pred_confidences = filter_confidences(pred_coords.squeeze(0), pred_confidences, 0.70)
                     #pred_coords, pred_confidences = apply_nms(pred_coords, pred_confidences)
 
                     all_pred_coords.append(pred_coords)
@@ -907,35 +933,152 @@ if __name__ == "__main__":
 
             CRNNtransform = transforms.Compose([
             transforms.ToTensor(),
-            #transforms.Normalize(mean=[0.3490, 0.3219, 0.2957], std=[0.2993, 0.2850, 0.2735])
+            transforms.Normalize(mean=means, std=stds)
         ])
 
 
 
             bboxes = []
             for bbox in all_pred_coords:
-                thisImage = ogImage.copy()
-                scale_y, scale_x  = getScales(newSize, oldSize)
-                thisBox = [0,0,0,0]
-                thisBox[0] = (bbox[0]*scale_x) - adjustX1
-                thisBox[1] = (bbox[1]*scale_y) - adjustY1
-                thisBox[2] = (bbox[2]*scale_x) - adjustX1
-                thisBox[3] = (bbox[3]*scale_y) - adjustY1
+                thisBox = torch.tensor([0, 0, 0, 0], dtype=torch.float32)  # Create a tensor
+                thisBox[0] = (bbox[0]  - adjustX1)/ scale_x
+                thisBox[1] = (bbox[1]  - adjustY1)/ scale_y
+                thisBox[2] = (bbox[2]  - adjustX1)/ scale_x
+                thisBox[3] = (bbox[3]  - adjustY1)/ scale_y
                 bboxes.append(thisBox)
+                
 
-            all_pred_coords = torch.cat(bboxes, dim=0)
+            # Convert list of tensors into a single tensor
+            all_pred_coords = torch.stack(bboxes)
 
-
-            path = DisplayImage.draw_bounding_boxes(rotated_img, None, all_pred_coords, 0,1, 0, BBtransform)
-            print("Image of bounding boxes taken, stored in path:")
+            path = DisplayImage.draw_bounding_boxes(ogImage, None, all_pred_coords, 0,1, 0, BBtransform)
+            print("Non Normalized copy stored in path:")
             print(path)
 
 
+            num_classes = len(Constants.char_set) + 1  # +1 for CTC blank label
+            CRNNModel = CRNN(num_classes=num_classes, nc=3).to(device)
+            checkpoint = torch.load("CRNNmodel_checkpoint_26.pth", map_location=device)
+            CRNNModel.load_state_dict(checkpoint['model_state_dict'])
+
+            image_tensor = CRNNtransform(ogImage.copy())
+            images = []
+            for bbox in all_pred_coords:
+                x_min_crop = max(0, int(bbox[0].round()))
+                y_min_crop = max(0, int(bbox[1].round()))
+                x_max_crop = int(bbox[2].round())
+                y_max_crop = int(bbox[3].round())
+
+                width_crop = x_max_crop - x_min_crop
+                height_crop = y_max_crop - y_min_crop
+
+                # Skip invalid crops
+                if width_crop <= 0 or height_crop <= 0:
+                    raise ValueError("Invalid crop dimensions")
+
+                # Crop the image tensor using the rotated bounding box
+                cropped_image = crop(
+                    image_tensor, y_min_crop, x_min_crop, height_crop, width_crop
+                )
+
+                fixed_height = 32
+                height = cropped_image.shape[1]
+                width = cropped_image.shape[2]
+                aspect_ratio = width / height
+                new_width = int(fixed_height * aspect_ratio)
+
+                # Resize to fixed height while maintaining aspect ratio
+                resized_image = transforms.functional.resize(
+                    cropped_image, size=(fixed_height, int(width * (fixed_height / height)))
+                )
+
+                images.append(resized_image)
+
+
+            images = custom_collate_fn(images)
+
+
+            images = images.to(device)
+
+
+            # Encode texts
+            label_encoder = LabelEncoder(Constants.char_set)
+
+            # Forward pass
+            outputs = CRNNModel(images)  # [T, N, C]
+            outputs = F.log_softmax(outputs, dim=2)
+
+            # Prepare input lengths
+            batch_size = images.size(0)
+            seq_len = outputs.size(0)
+            input_lengths = torch.full(size=(batch_size,), fill_value=seq_len, dtype=torch.long, device=device)
+
+            _, preds = outputs.max(2)
+            preds = preds.transpose(1, 0).contiguous()  # [N, T]
+            pred_texts = label_encoder.decode(preds)
+
+            folder = "./backend/training_data/verify/epoch 0/text"
+            if not os.path.exists(folder):
+                os.makedirs(folder)
+
+            i = 0
+            for i in range(len(pred_texts)-1):
+                predicted_text = pred_texts[i] if len(pred_texts) > 0 else ''
+                img = transforms.ToPILImage()(images[i].squeeze(0).clamp(0, 1))
+                sanitized_prediction = sanitize_filename(predicted_text)
+                img.save(folder + "/" + sanitized_prediction + "_("+str(i)+").png")
+
+            print("All cropped images saved in:")
+            print(folder)
+            print("Named predictedText_(counter).png")
+
+
+            output_file = "./backend/training_data/verify/epoch 0/output.txt"
+
+
+
+            print(f"The list of predictions has been written to {folder +"/" + output_file}")
 
 
 
 
 
+
+            line_threshold = 15
+
+            # Combine coordinates and texts
+            predictions = list(zip(all_pred_coords, pred_texts))
+
+            # Sort by `y1` (top coordinate)
+            predictions.sort(key=lambda x: x[0][1])  # Sort by y1
+
+            # Group into lines
+            lines = []
+            current_line = [predictions[0]]
+
+            for i in range(1, len(predictions)):
+                current_box = predictions[i][0]
+                previous_box = current_line[-1][0]
+
+                # If the current box's `y1` is close to the previous box's `y1`, they belong to the same line
+                if abs(current_box[1] - previous_box[1]) <= line_threshold:
+                    current_line.append(predictions[i])
+                else:
+                    # Start a new line
+                    lines.append(current_line)
+                    current_line = [predictions[i]]
+
+            # Add the last line
+            if current_line:
+                lines.append(current_line)
+
+            # Sort each line by `x1` (left coordinate) and print texts
+
+            with open(output_file, "w") as file:          
+                for line in lines:
+                    line.sort(key=lambda x: x[0][0])  # Sort by x1
+                    line_text = " ".join([text for _, text in line])
+                    file.write(line_text + "\n")
 
 
 

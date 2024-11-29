@@ -12,7 +12,6 @@ from torch.utils.data import DataLoader
 import torchvision.transforms.functional as F
 from GIoULoss import GIoULoss
 import DisplayImage
-from yolov5.models.yolo import Detect
 from customDataSet import CustomImageDataset
 import torchvision.ops as ops
 from transforms import ResizeToMaxDimension

@@ -239,7 +239,6 @@ class CustomImageDataset2(Dataset):
                 image_tensor, y_min_crop, x_min_crop, height_crop, width_crop
             )
 
-            #Number is from a single calculate anchor box
             fixed_height = 32
             height = cropped_image.shape[1]
             width = cropped_image.shape[2]
