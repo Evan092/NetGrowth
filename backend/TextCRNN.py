@@ -16,9 +16,12 @@ from torch.utils.data import DataLoader
 import Constants
 from transforms import ResizeToMaxDimension
 from customDataSet2 import CustomImageDataset2
+from customDataSet3 import CustomImageDataset3
 from PIL import Image
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
+from torch.optim.lr_scheduler import SequentialLR, LinearLR, ReduceLROnPlateau
+
 
 class LabelEncoder:
     def __init__(self, char_set):
@@ -125,7 +128,7 @@ def custom_collate_fn(batch):
     if not batch:
         return None, None
 
-    images, texts, _ = zip(*batch)
+    images, texts = zip(*batch)
 
     # Define consistent transformations
     transform = transforms.Compose([
@@ -137,10 +140,10 @@ def custom_collate_fn(batch):
     max_width = max([img.shape[2] for img in images])
     processed_images = []
     for img in images:
-        img = transforms.ToPILImage()(img.cpu())
-        img = transform(img)
+        #img = transforms.ToPILImage()(img.cpu())
+        #img = transform(img)
         padding = (0, max_width - img.shape[2], 0, 0)
-        padded_img = F.pad(img, padding)
+        padded_img = F.pad(img, padding, value=0.5)
         processed_images.append(padded_img)
 
     # Stack images into a tensor of shape [batch_size, channels, height, width]
@@ -213,7 +216,7 @@ def evaluate(model, loader, criterion):
     total_chars = 0
 
     with torch.no_grad():
-        for batch_idx, (images, texts) in enumerate(loader):
+        for images, texts in loader:
             if images is None or texts is None:
                 continue  # Skip invalid samples
 
@@ -231,9 +234,11 @@ def evaluate(model, loader, criterion):
             # Prepare input lengths
             batch_size = images.size(0)
             seq_len = outputs.size(0)
-            input_lengths = torch.full(size=(batch_size,), fill_value=seq_len, dtype=torch.long, device=device)
+            input_lengths = torch.full(
+                size=(batch_size,), fill_value=seq_len, dtype=torch.long
+            ).to(device)
 
-            # Compute loss
+            # Compute CTC loss
             loss = criterion(outputs, targets, input_lengths, target_lengths)
 
             running_loss += loss.item()
@@ -243,19 +248,6 @@ def evaluate(model, loader, criterion):
             _, preds = outputs.max(2)
             preds = preds.transpose(1, 0).contiguous()  # [N, T]
             pred_texts = label_encoder.decode(preds)
-
-            if printing:
-                target_text = texts[0] if len(texts) > 0 else ''
-                predicted_text = pred_texts[0] if len(pred_texts) > 0 else ''
-                print(
-                    f"Epoch [{epoch+1}], Batch [{batch_idx+1}/{len(loader)}], epoch loss: {running_loss / total_batches} , Loss: {loss.item():.4f}, "
-                    f"Target: '{target_text}', Predicted: '{predicted_text}'"
-                )
-                rotated_img = transforms.ToPILImage()(images[0].squeeze(0).clamp(0, 1))
-                folder = "./backend/training_data/verify/text epoch " + str(epoch)
-                if not os.path.exists(folder):
-                    os.makedirs(folder)
-                rotated_img.save(folder + "/" + str(batch_idx) + ".png")
 
             # Calculate character-level accuracy
             for pred_text, target_text in zip(pred_texts, texts):
@@ -336,8 +328,8 @@ class RandomBlur:
 
 
 if __name__ == '__main__':
-    batch_size = 1
-    learning_rate = 0.0001#4e-5
+    batch_size = 64
+    learning_rate = 3.10E-10#8.6e-8
     weight_decay = 3.7e-5
     num_epochs = 1000
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -357,14 +349,14 @@ if __name__ == '__main__':
     ])
 
     # Datasets and DataLoaders
-    train_dataset = CustomImageDataset2(img_dir='./backend/training_data/', transform=transform, train=True)
-    test_dataset = CustomImageDataset2(img_dir='./backend/training_data/', transform=transform, train=False)
+    train_dataset = CustomImageDataset3(img_dir='./backend/training_data/', transform=transform, train=True)
+    #test_dataset = CustomImageDataset2(img_dir='./backend/training_data/', transform=transform, train=False)
 
 
     #verify_char_set(train_dataset,label_encoder)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=1,prefetch_factor=2,persistent_workers=True, pin_memory=True, collate_fn=custom_collate_fn)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=1,prefetch_factor=2,persistent_workers=True, pin_memory=True,  collate_fn=custom_collate_fn)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8,prefetch_factor=2,persistent_workers=True, pin_memory=True, collate_fn=custom_collate_fn)
+    #test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=1,prefetch_factor=2,persistent_workers=True, pin_memory=True,  collate_fn=custom_collate_fn)
 
     # Model, criterion, optimizer
     num_classes = len(Constants.char_set) + 1  # +1 for CTC blank label
@@ -374,9 +366,10 @@ if __name__ == '__main__':
 
     # TensorBoard writer
     writer = SummaryWriter()
+    plateau_scheduler = ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.2, threshold=0.01)
 
     if True:
-        checkpoint = torch.load("CRNNmodel_checkpoint_7.pth", map_location=device)
+        checkpoint = torch.load("CRNNmodel_checkpoint_62.pth", map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         epoch = checkpoint['epoch']
@@ -397,7 +390,7 @@ if __name__ == '__main__':
             lr_finder = LRFinder(model, optimizer, lrCriterion, device=device)
             model.train()
 
-            lr_finder.range_test(train_loader, start_lr=1e-7, end_lr=0.001, num_iter=600)
+            lr_finder.range_test(train_loader, start_lr=1e-10, end_lr=0.0001, num_iter=600)
             lr_finder.plot()
 
             plt.savefig('lr_finder_plot.png')  # Saves the plot to a file
@@ -415,22 +408,27 @@ if __name__ == '__main__':
 
     # Training loop
     for epoch in range(num_epochs):
-        #train_loss = train(model, train_loader, criterion, optimizer, epoch)
-        val_loss, val_acc = evaluate(model, test_loader, criterion)
-        print(f'Epoch [{epoch+1}/{num_epochs}], Train Loss: {test_loader:.4f}')#, Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%')
+        try:
+            train_loss = train(model, train_loader, criterion, optimizer, epoch)
+            #val_loss, val_acc = evaluate(model, test_loader, criterion)
+            print(f'Epoch [{epoch+1}/{num_epochs}], Train Loss: {train_loss:.4f}')#, Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%')
+            plateau_scheduler.step(train_loss)
+            # Log to TensorBoard
+            writer.add_scalar('Loss/Train', train_loss, epoch)
+            #writer.add_scalar('Loss/Validation', val_loss, epoch)
+            #writer.add_scalar('Accuracy/Validation', val_acc, epoch)
 
-        # Log to TensorBoard
-        writer.add_scalar('Loss/Train', test_loader, epoch)
-        #writer.add_scalar('Loss/Validation', val_loss, epoch)
-        #writer.add_scalar('Accuracy/Validation', val_acc, epoch)
+        except Exception as e:
+            print("ree")
 
-        # Save checkpoint
-        torch.save({
-            'epoch': epoch + 1,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'loss': train_loss,
-        }, f"CRNNmodel_checkpoint_{epoch+1}.pth")
+        finally:
+            # Save checkpoint
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': train_loss,
+            }, f"CRNNmodel_checkpoint_{epoch+1}.pth")
 
     writer.close()
 

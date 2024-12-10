@@ -46,7 +46,7 @@ def resize_and_pad_deprecated(image, desired_size, color=(0, 0, 0)):
 
 epoch = 0
 i = 0
-def draw_bounding_boxes(image, truth_boxes, pred_boxes, epoch1, i1, n, transform=None, truth_color=(255, 0, 0), pred_color=(0, 255, 0), thickness=2):
+def draw_bounding_boxes(image, truth_boxes, pred_boxes, pred_confidences, epoch1, i1, n, transform=None, truth_color=(255, 0, 0), pred_color=(0, 255, 0), thickness=2):
     """
     Draw truth and predicted bounding boxes on an image and display it.
 
@@ -59,7 +59,7 @@ def draw_bounding_boxes(image, truth_boxes, pred_boxes, epoch1, i1, n, transform
     - thickness: line thickness of the boxes.
     """
     epoch=epoch1
-    i=i1
+    ind=i1
     # Read the image
     
     #image = resize_and_pad(image, Constants.desired_size)
@@ -76,12 +76,15 @@ def draw_bounding_boxes(image, truth_boxes, pred_boxes, epoch1, i1, n, transform
 
     # Draw predicted boxes
     if pred_boxes is not None:
-        for (x1, y1, x2, y2) in pred_boxes.squeeze(1):
+        for i in range(pred_boxes.shape[0]):
+            (x1, y1, x2, y2) = pred_boxes[i]
+            confidence = pred_confidences[i]
             start_point = (int(x1), int(y1))
             end_point = (int(x2), int(y2))
+            pred_color=(0, 255*pow(confidence.item(),20), 0)
             image = cv2.rectangle(image, start_point, end_point, pred_color, thickness)
 
-    return start_display_process(image, epoch, i)
+    return start_display_process(image, epoch, ind)
 
 def display_image(image):
     """Display an image using matplotlib."""
@@ -101,7 +104,7 @@ def save_image(image, file_path):
 def start_display_process(image, epoch, i):
     """Start a new process to display the image."""
     #display_process = multiprocessing.Process(target=display_image, args=(image,))
-    folder = "./backend/training_data/verify/epoch " + str(epoch)
+    folder = "../backend/training_data/verify/epoch " + str(epoch)
     if not os.path.exists(folder):
         os.makedirs(folder)
     save_image(image, folder + "/Image " + str(i))

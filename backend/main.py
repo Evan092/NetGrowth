@@ -426,6 +426,35 @@ def apply_nms(pred_boxes, confidences, iou_threshold=0.5):
     return kept_boxes, kept_confidences
 
 
+def filter_aspect_ratio(pred_boxes, confidences, aspect_ratio_condition):
+    """
+    Filter bounding boxes based on an aspect ratio condition (e.g., width > height).
+
+    Parameters:
+    - pred_boxes: Tensor of predicted boxes [N, 4], where each box is (x1, y1, x2, y2).
+    - confidences: Tensor of confidence scores [N, 1].
+    - aspect_ratio_condition: Callable that takes width and height as inputs and returns True if the box satisfies the condition.
+
+    Returns:
+    - filtered_boxes: Tensor of boxes that satisfy the aspect ratio condition.
+    - filtered_confidences: Tensor of confidence scores of the filtered boxes, shape [M, 1] where M is the number of boxes kept.
+    """
+    # Calculate the width and height of each box
+    widths = pred_boxes[:, 2] - pred_boxes[:, 0]
+    heights = pred_boxes[:, 3] - pred_boxes[:, 1]
+
+    # Apply the aspect ratio condition
+    keep_indices = [i for i, (w, h) in enumerate(zip(widths, heights)) if aspect_ratio_condition(w, h)]
+
+    # Index the results with keep_indices
+    filtered_boxes = pred_boxes[keep_indices]
+    filtered_confidences = confidences[keep_indices]
+
+    return filtered_boxes, filtered_confidences
+
+def aspect_ratio_condition(width, height):
+    return width > height
+
 def train(model, loader, criterion, optimizer, optionalLoader=None):
     model = model.to(device)
     model.train()  # Set the model to training mode
@@ -585,6 +614,8 @@ def evaluate(model, loader, criterion):
         epoch_iou = 100 * (total_iou / total)
         return epoch_loss, epoch_iou
 
+
+
 def get_mean_std(loader):
     mean = 0.0
     std = 0.0
@@ -717,6 +748,80 @@ def compute_max_boxes(dataloader):
     return max_boxes
 
 
+def weighted_box_fusion(pred_boxes, confidences, iou_threshold=0.5):
+    """
+    Apply Weighted Box Fusion (WBF) to combine overlapping boxes into a single box with higher precision.
+
+    Parameters:
+    - pred_boxes: Tensor of predicted boxes [N, 4], where each box is (x1, y1, x2, y2).
+    - confidences: Tensor of confidence scores [N, 1].
+    - iou_threshold: Float, the IoU threshold for grouping boxes.
+
+    Returns:
+    - fused_boxes: Tensor of boxes after applying WBF.
+    - fused_confidences: Tensor of confidence scores for fused boxes, shape [K, 1] where K is the number of fused boxes.
+    """
+    if pred_boxes.size(0) == 0:
+        return pred_boxes, confidences
+
+    # Sort boxes by confidence scores in descending order
+    sorted_indices = torch.argsort(confidences.squeeze(1), descending=True)
+    pred_boxes = pred_boxes[sorted_indices]
+    confidences = confidences[sorted_indices]
+
+    fused_boxes = []
+    fused_confidences = []
+    used_indices = set()
+
+    # Helper function to calculate IoU
+    def calculate_iou(box1, box2):
+        inter_x1 = max(box1[0], box2[0])
+        inter_y1 = max(box1[1], box2[1])
+        inter_x2 = min(box1[2], box2[2])
+        inter_y2 = min(box1[3], box2[3])
+
+        inter_area = max(0, inter_x2 - inter_x1) * max(0, inter_y2 - inter_y1)
+        box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+
+        union_area = box1_area + box2_area - inter_area
+        return inter_area / union_area if union_area > 0 else 0
+
+    for i, box in enumerate(pred_boxes):
+        if i in used_indices:
+            continue
+
+        # Group overlapping boxes
+        group_boxes = [box]
+        group_confidences = [confidences[i]]
+        used_indices.add(i)
+
+        for j in range(i + 1, pred_boxes.size(0)):
+            if j in used_indices:
+                continue
+            if calculate_iou(box, pred_boxes[j]) > iou_threshold:
+                group_boxes.append(pred_boxes[j])
+                group_confidences.append(confidences[j])
+                used_indices.add(j)
+
+        # Compute weighted box
+        group_boxes = torch.stack(group_boxes)
+        group_confidences = torch.stack(group_confidences).squeeze(1)
+
+        weights = group_confidences / group_confidences.sum()
+        weighted_box = torch.sum(group_boxes * weights[:, None], dim=0)
+
+        # Add fused box and its confidence
+        fused_boxes.append(weighted_box)
+        fused_confidences.append(group_confidences.mean())
+
+    # Convert lists to tensors
+    fused_boxes = torch.stack(fused_boxes)
+    fused_confidences = torch.tensor(fused_confidences).unsqueeze(1)
+
+    return fused_boxes, fused_confidences
+
+
 def pad_to_target_size(image_tensor, target_width, target_height):
     # Get the current tensor dimensions (assuming shape is [C, W, H])
     _, height, width = image_tensor.shape
@@ -774,6 +879,51 @@ def custom_collate_fn(batch):
     images = torch.stack(processed_images, dim=0)
     return images
 
+def remove_contained_boxes(pred_boxes, confidences):
+    """
+    Removes boxes that are fully contained within a more confident box.
+
+    Parameters:
+    - pred_boxes: Tensor of predicted boxes [N, 4], where each box is (x1, y1, x2, y2).
+    - confidences: Tensor of confidence scores [N, 1].
+
+    Returns:
+    - filtered_boxes: Tensor of boxes after removing fully contained ones.
+    - filtered_confidences: Tensor of confidence scores for the remaining boxes, shape [M, 1].
+    """
+    if pred_boxes.size(0) == 0:
+        return pred_boxes, confidences
+
+    # Sort boxes by confidence scores in descending order
+    sorted_indices = torch.argsort(confidences.squeeze(1), descending=True)
+    pred_boxes = pred_boxes[sorted_indices]
+    confidences = confidences[sorted_indices]
+
+    keep_indices = []
+
+    # Helper function to check if box1 contains box2
+    def is_contained(box1, box2):
+        return (
+            box1[0] <= box2[0] and box1[1] <= box2[1] and
+            box1[2] >= box2[2] and box1[3] >= box2[3]
+        )
+
+    for i in range(pred_boxes.size(0)):
+        contained = False
+        for j in range(i):
+            if is_contained(pred_boxes[j], pred_boxes[i]):
+                contained = True
+                break
+        if not contained:
+            keep_indices.append(i)
+
+    # Index the results with keep_indices
+    filtered_boxes = pred_boxes[keep_indices]
+    filtered_confidences = confidences[keep_indices]
+
+    return filtered_boxes, filtered_confidences
+
+
 def sanitize_filename(filename):
     """
     Remove or replace invalid characters in a filename.
@@ -783,6 +933,86 @@ def sanitize_filename(filename):
     for char in invalid_chars:
         filename = filename.replace(char, "_")  # Replace invalid characters with underscores
     return filename
+
+def combine_boxes(pred_boxes, confidences, overlap_threshold=0.5):
+    """
+    Combine bounding boxes if a specified percentage of one box is within another box.
+    Combines them into the smallest box that contains both.
+
+    Parameters:
+    - pred_boxes: Tensor of predicted boxes [N, 4], where each box is (x1, y1, x2, y2).
+    - confidences: Tensor of confidence scores [N, 1].
+    - overlap_threshold: Float, the percentage threshold for considering boxes for merging.
+
+    Returns:
+    - combined_boxes: Tensor of boxes after merging.
+    - combined_confidences: Tensor of confidence scores for the combined boxes, shape [M, 1].
+    """
+    if pred_boxes.size(0) == 0:
+        return pred_boxes, confidences
+
+    # Sort boxes by confidence scores in descending order
+    sorted_indices = torch.argsort(confidences.squeeze(1), descending=True)
+    pred_boxes = pred_boxes[sorted_indices]
+    confidences = confidences[sorted_indices]
+
+    combined_boxes = []
+    combined_confidences = []
+    used_indices = set()
+
+    # Helper function to calculate overlap percentages
+    def calculate_overlap(box1, box2):
+        inter_x1 = max(box1[0], box2[0])
+        inter_y1 = max(box1[1], box2[1])
+        inter_x2 = min(box1[2], box2[2])
+        inter_y2 = min(box1[3], box2[3])
+
+        inter_area = max(0, inter_x2 - inter_x1) * max(0, inter_y2 - inter_y1)
+        box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+
+        # Calculate the fraction of each box that is overlapped
+        overlap1 = inter_area / box1_area if box1_area > 0 else 0
+        overlap2 = inter_area / box2_area if box2_area > 0 else 0
+
+        return overlap1, overlap2
+
+    for i, box1 in enumerate(pred_boxes):
+        if i in used_indices:
+            continue
+
+        group_boxes = [box1]
+        group_confidences = [confidences[i]]
+        used_indices.add(i)
+
+        for j in range(i + 1, pred_boxes.size(0)):
+            if j in used_indices:
+                continue
+            box2 = pred_boxes[j]
+            overlap1, overlap2 = calculate_overlap(box1, box2)
+            if overlap1 >= overlap_threshold or overlap2 >= overlap_threshold:
+                group_boxes.append(box2)
+                group_confidences.append(confidences[j])
+                used_indices.add(j)
+
+        # Combine boxes into the smallest box containing all group boxes
+        group_boxes = torch.stack(group_boxes)
+        x1_min, y1_min = torch.min(group_boxes[:, 0]), torch.min(group_boxes[:, 1])
+        x2_max, y2_max = torch.max(group_boxes[:, 2]), torch.max(group_boxes[:, 3])
+        combined_box = torch.tensor([x1_min, y1_min, x2_max, y2_max])
+
+        # Use the highest confidence score for the combined box
+        combined_confidence = max(group_confidences)
+
+        combined_boxes.append(combined_box)
+        combined_confidences.append(combined_confidence)
+
+    # Convert lists to tensors
+    combined_boxes = torch.stack(combined_boxes)
+    combined_confidences = torch.tensor(combined_confidences).unsqueeze(1)
+
+    return combined_boxes, combined_confidences
+
 
 
 epoch = 0
@@ -844,7 +1074,7 @@ if __name__ == "__main__":
             newSize = (image.shape[1], image.shape[2])
             scale_y, scale_x  = getScales(oldSize, newSize)
             image, (adjustX1, adjustX2, adjustY1, adjustY2)  = pad_to_target_size(image, Constants.desired_size, Constants.desired_size)
-            with open('anchor_boxes.json', 'r') as file:
+            with open('../anchor_boxes.json', 'r') as file:
                 loaded_anchor_boxes = json.load(file)
                 loaded_anchor_boxes = torch.tensor(loaded_anchor_boxes, dtype=torch.float32)
 
@@ -875,7 +1105,7 @@ if __name__ == "__main__":
 
             max_norm = 5
 
-            checkpoint = torch.load("model_checkpoint184.pth", map_location=device)
+            checkpoint = torch.load("../model_checkpoint213.pth", map_location=device)
             cnn_model.load_state_dict(checkpoint['model_state_dict'])
 
 
@@ -905,7 +1135,7 @@ if __name__ == "__main__":
                     pred_confidences = pred_confidences.view(-1, 1)
 
                     #pred_coords =  #yolo_to_corners(pred_coords.squeeze(0))
-                    pred_coords, pred_confidences = filter_confidences(pred_coords.squeeze(0), pred_confidences, 0.70)
+                    pred_coords, pred_confidences = filter_confidences(pred_coords.squeeze(0), pred_confidences, 0.90)
                     #pred_coords, pred_confidences = apply_nms(pred_coords, pred_confidences)
 
                     all_pred_coords.append(pred_coords)
@@ -915,8 +1145,15 @@ if __name__ == "__main__":
                 all_pred_coords = torch.cat(all_pred_coords, dim=0)  # Shape: (total_boxes, 4)
                 all_pred_confidences = torch.cat(all_pred_confidences, dim=0)  # Shape: (total_boxes, 1)
 
-            all_pred_coords, all_pred_confidences = apply_nms(all_pred_coords, all_pred_confidences, 0.7)
-            all_pred_coords, all_pred_confidences = apply_nms(all_pred_coords, all_pred_confidences, 0.3)
+
+
+            all_pred_coords, all_pred_confidences = remove_contained_boxes(all_pred_coords, all_pred_confidences)
+            all_pred_coords, all_pred_confidences = apply_nms(all_pred_coords, all_pred_confidences, 0.5) #.1
+            #apc, apc2 = weighted_box_fusion(apc, apc2, 0.6)
+            all_pred_coords, all_pred_confidences = weighted_box_fusion(all_pred_coords, all_pred_confidences, 0.9)
+            all_pred_coords, all_pred_confidences = combine_boxes(all_pred_coords, all_pred_confidences, 0.7)
+            all_pred_coords, all_pred_confidences = combine_boxes(all_pred_coords, all_pred_confidences, 0.35)
+
 
             mean=torch.tensor(means).to(device)
             std=torch.tensor(stds).to(device)
@@ -925,7 +1162,7 @@ if __name__ == "__main__":
             # Convert to PIL for display
             rotated_img = transforms.ToPILImage()(image.squeeze(0).clamp(0, 1))
             #bbox.squeeze()
-            path = DisplayImage.draw_bounding_boxes(rotated_img, None, all_pred_coords, 0,0, 0, BBtransform)
+            path = DisplayImage.draw_bounding_boxes(rotated_img, None, all_pred_coords, all_pred_confidences, 0,0, 0, BBtransform)
             print("Image of bounding boxes taken, stored in path:")
             print(path)
 
@@ -951,14 +1188,14 @@ if __name__ == "__main__":
             # Convert list of tensors into a single tensor
             all_pred_coords = torch.stack(bboxes)
 
-            path = DisplayImage.draw_bounding_boxes(ogImage, None, all_pred_coords, 0,1, 0, BBtransform)
+            path = DisplayImage.draw_bounding_boxes(ogImage, None, all_pred_coords, all_pred_confidences, 0,1, 0, BBtransform)
             print("Non Normalized copy stored in path:")
             print(path)
 
 
             num_classes = len(Constants.char_set) + 1  # +1 for CTC blank label
             CRNNModel = CRNN(num_classes=num_classes, nc=3).to(device)
-            checkpoint = torch.load("CRNNmodel_checkpoint_26.pth", map_location=device)
+            checkpoint = torch.load("../CRNNmodel_checkpoint_6.pth", map_location=device)
             CRNNModel.load_state_dict(checkpoint['model_state_dict'])
 
             image_tensor = CRNNtransform(ogImage.copy())
@@ -1017,12 +1254,12 @@ if __name__ == "__main__":
             preds = preds.transpose(1, 0).contiguous()  # [N, T]
             pred_texts = label_encoder.decode(preds)
 
-            folder = "./backend/training_data/verify/epoch 0/text"
+            folder = "../backend/training_data/verify/epoch 0/text"
             if not os.path.exists(folder):
                 os.makedirs(folder)
 
             i = 0
-            for i in range(len(pred_texts)-1):
+            for i in range(len(pred_texts)):
                 predicted_text = pred_texts[i] if len(pred_texts) > 0 else ''
                 img = transforms.ToPILImage()(images[i].squeeze(0).clamp(0, 1))
                 sanitized_prediction = sanitize_filename(predicted_text)
@@ -1033,7 +1270,7 @@ if __name__ == "__main__":
             print("Named predictedText_(counter).png")
 
 
-            output_file = "./backend/training_data/verify/epoch 0/output.txt"
+            output_file = "../backend/training_data/verify/epoch 0/output.txt"
 
 
 
@@ -1044,7 +1281,7 @@ if __name__ == "__main__":
 
 
 
-            line_threshold = 15
+            line_threshold = 30
 
             # Combine coordinates and texts
             predictions = list(zip(all_pred_coords, pred_texts))

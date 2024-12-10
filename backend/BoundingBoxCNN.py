@@ -1,7 +1,6 @@
 import json
 import os
 import random
-from charset_normalizer import detect
 import torch
 import time
 import torch.nn as nn
@@ -932,7 +931,7 @@ if __name__ == "__main__":
                 print(f"Calculated std: {std}")
 
             if True:
-                checkpoint = torch.load("model_checkpoint91.pth", map_location=device)
+                checkpoint = torch.load("model_checkpoint213.pth", map_location=device)
                 cnn_model.load_state_dict(checkpoint['model_state_dict'])
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 epoch = checkpoint['epoch']
@@ -985,7 +984,7 @@ if __name__ == "__main__":
 
 
 
-            num_epochs = 200
+            num_epochs = 300
             print()
 
 
