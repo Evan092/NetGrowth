@@ -1195,7 +1195,7 @@ if __name__ == "__main__":
 
             num_classes = len(Constants.char_set) + 1  # +1 for CTC blank label
             CRNNModel = CRNN(num_classes=num_classes, nc=3).to(device)
-            checkpoint = torch.load("../CRNNmodel_checkpoint_6.pth", map_location=device)
+            checkpoint = torch.load("../CRNNmodel_checkpoint_62.pth", map_location=device)
             CRNNModel.load_state_dict(checkpoint['model_state_dict'])
 
             image_tensor = CRNNtransform(ogImage.copy())
@@ -1274,7 +1274,8 @@ if __name__ == "__main__":
 
 
 
-            print(f"The list of predictions has been written to {folder +"/" + output_file}")
+            print(f"The list of predictions has been written to {folder}")
+            print(f"output file written to: {output_file}")
 
 
 
