@@ -2,6 +2,10 @@ Final
 [Evan Snowgold]
 [esnowgol@emich.edu]
 December 10, 2024
+
+Video:
+https://drive.google.com/file/d/14iVHsARd67QYdWkTXBe2DBxJt5zrY7Ji/view?usp=sharing
+
 Usage[1]
 1. Using command prompt, cd to NetGrowth folder
 2. Load Conda Enviroment using environment.yml (conda env create -f environment.yml)
